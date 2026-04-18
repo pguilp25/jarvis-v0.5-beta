@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>J.A.R.V.I.S.</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+--bg:#3a3a42;--bg1:#424247;--bg2:#4d4d54;--bg3:#59595f;--bg4:#66666d;
+--bdr:#636369;--bdr2:#727279;
+--ac:#b4bcc2;--acd:#b4bcc255;--acdd:#b4bcc220;--acbg:#4d5355;
+--grn:#a8e4b4;--yel:#e8d19e;--red:#e8a8a8;
+--tx:#f2f2f5;--tx2:#b3b3b8;--tx3:#8c8c91;--w:#ffffff;
+--ubg:#4d4d50;--ubdr:#707076;--ibg:#48484c;
+--tx:#f0f0f5;--tx2:#b1b1b7;--tx3:#898991;--w:#ffffff;
+--ubg:#4d4d50;--ubdr:#707076;--ibg:#48484c;
+}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--tx);height:100vh;display:flex;overflow:hidden}
+
+/* ═ Sidebar ═ */
+.sb{width:250px;background:var(--bg1);border-right:1px solid var(--bdr);display:flex;flex-direction:column;flex-shrink:0}
+.sb-hd{padding:16px;display:flex;flex-direction:column;gap:8px}
+.brand{display:flex;align-items:center;gap:10px}
+.orb{width:22px;height:22px;border-radius:50%;background:radial-gradient(circle at 35% 35%,var(--ac),#2e3e48);box-shadow:0 0 10px var(--acd)}
+.bname{font-family:'IBM Plex Mono',monospace;font-weight:600;font-size:13px;color:var(--ac);letter-spacing:3px}
+.bsub{font-size:9px;color:var(--tx3);letter-spacing:1px;margin-top:1px}
+.sb-btns{display:flex;flex-direction:column;gap:4px;margin-top:4px}
+.sb-btn{width:100%;padding:8px 10px;border:none;border-radius:3px;background:var(--bg2);color:var(--tx2);font-family:'DM Sans',sans-serif;font-size:12px;cursor:pointer;transition:all .12s;text-align:left;display:flex;align-items:center;gap:8px}
+.sb-btn:hover{color:var(--ac);background:var(--bg3)}
+.sb-btn .ico{font-size:13px;width:18px;text-align:center}
+.cl{flex:1;overflow-y:auto;padding:6px}
+.cl::-webkit-scrollbar{width:2px}
+.cl::-webkit-scrollbar-thumb{background:var(--bdr)}
+.ci{padding:9px 12px;border-radius:2px;cursor:pointer;display:flex;align-items:center;justify-content:space-between;margin-bottom:1px;transition:background .08s;border-left:2px solid transparent}
+.ci:hover{background:var(--bg2)}
+.ci.on{background:var(--bg3);border-left-color:var(--ac)}
+.ci .n{font-size:12px;color:var(--tx2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.ci.on .n{color:var(--w)}
+.ci .d{opacity:0;background:none;border:none;color:var(--tx3);cursor:pointer;font-size:11px;padding:2px 5px;transition:opacity .1s}
+.ci:hover .d{opacity:.6}
+.ci .d:hover{opacity:1;color:var(--red)}
+.sb-ft{padding:8px 14px;border-top:1px solid var(--bdr);display:flex;align-items:center;gap:6px;cursor:pointer;font-family:'IBM Plex Mono',monospace;font-size:9.5px;color:var(--tx3)}
+.sb-ft:hover{color:var(--ac)}
+.pdot{width:5px;height:5px;border-radius:50%;background:var(--tx3)}.pdot.on{background:var(--grn)}
+
+/* ═ Main ═ */
+.mn{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
+.chat-view{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
+.chat-view.hide{display:none}
+.top{height:40px;border-bottom:1px solid var(--bdr);display:flex;align-items:center;padding:0 16px;flex-shrink:0;background:var(--bg1)}
+.top-t{font-size:13px;font-weight:500;color:var(--tx2)}
+
+/* Messages */
+.ms{flex:1;overflow-y:auto;padding:20px 12%;min-height:0}
+.ms::-webkit-scrollbar{width:4px}
+.ms::-webkit-scrollbar-thumb{background:var(--bdr);border-radius:2px}
+@media(max-width:1200px){.ms,.sbar{padding-left:5%;padding-right:5%}}
+
+/* User bubble */
+.mu{display:flex;justify-content:flex-end;margin-bottom:6px}
+.mu-in{max-width:600px;background:var(--ubg);border:1px solid var(--ubdr);border-radius:16px 16px 4px 16px;padding:14px 20px;font-size:14.5px;line-height:1.65;color:var(--w)}
+
+/* ── Inline thinking (appears after user msg, before response) ── */
+.think-block{margin-bottom:6px;max-width:760px}
+
+/* Summary line */
+.think-sum{
+  display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;user-select:none;
+}
+.think-pulse{width:5px;height:5px;border-radius:50%;background:var(--ac);flex-shrink:0}
+.think-pulse.on{animation:pl 1.6s infinite}
+@keyframes pl{0%,100%{opacity:.3;transform:scale(.7)}50%{opacity:1;transform:scale(1.1)}}
+.think-text{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--tx3);flex:1}
+.think-arrow{font-size:9px;color:var(--tx3);transition:transform .15s}
+.think-sum.exp .think-arrow{transform:rotate(180deg)}
+
+/* Expanded: list of calls */
+.think-calls{display:none;padding-left:13px}
+.think-calls.open{display:block}
+
+/* Each call = one API round */
+.tc-item{padding:3px 0;cursor:pointer;display:flex;align-items:center;gap:7px}
+.tc-dot{width:4px;height:4px;border-radius:50%;flex-shrink:0}
+.tc-dot.active{background:var(--ac);animation:pl 1.6s infinite}
+.tc-dot.done{background:var(--grn)}
+.tc-name{font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--tx3);transition:color .1s}
+.tc-item:hover .tc-name{color:var(--tx)}
+.tc-name.open{color:var(--ac)}
+
+/* Call content (raw thinking) */
+.tc-content{
+  display:none;padding:6px 0 6px 11px;
+  font-family:'IBM Plex Mono',monospace;font-size:10px;line-height:1.5;
+  color:var(--tx3);white-space:pre-wrap;word-break:break-word;
+  max-height:250px;overflow-y:auto;
+}
+.tc-content.open{display:block}
+.tc-content::-webkit-scrollbar{width:2px}
+.tc-content::-webkit-scrollbar-thumb{background:var(--bdr)}
+
+/* JARVIS response — no border */
+.ma{margin-bottom:24px;max-width:760px;font-size:14.5px;line-height:1.72;color:var(--tx)}
+.ma .jl{font-family:'IBM Plex Mono',monospace;font-size:9px;font-weight:500;color:var(--ac);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.ma .jd{width:5px;height:5px;border-radius:50%;background:var(--ac)}
+.ma p{margin-bottom:10px}.ma p:last-child{margin-bottom:0}
+.ma strong{color:var(--w);font-weight:600}
+.ma code{background:var(--bg3);color:var(--ac);padding:1px 5px;border-radius:3px;font-family:'IBM Plex Mono',monospace;font-size:12.5px}
+.ma pre{background:var(--bg);border:1px solid var(--bdr);border-radius:4px;padding:14px;overflow-x:auto;margin:10px 0}
+.ma pre code{background:none;padding:0;color:var(--w);font-size:12.5px;line-height:1.55}
+.ma ul,.ma ol{margin:8px 0 8px 18px}.ma li{margin-bottom:4px}
+.ma blockquote{border-left:2px solid var(--bdr2);padding-left:12px;margin:8px 0;color:var(--tx2);font-style:italic}
+.ma img{max-width:100%;border-radius:4px;margin:8px 0;border:1px solid var(--bdr)}
+.ma h1,.ma h2,.ma h3{color:var(--w);margin:14px 0 6px;font-weight:600}
+.ms-sys{text-align:center;margin-bottom:16px;padding:8px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--yel)}
+
+/* Sandbox bar */
+.sbar{display:none;padding:10px 12%;background:var(--bg2);border-top:1px solid var(--bdr);align-items:center;gap:10px}
+.sbar.on{display:flex}
+.sbar .si{flex:1;font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--tx3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.xbtn{font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:500;padding:6px 14px;border:none;border-radius:2px;cursor:pointer;transition:all .1s}
+.xbtn-y{background:#1e3d2b;color:var(--grn)}.xbtn-y:hover{background:#285035}
+.xbtn-n{background:#3d1e1e;color:var(--red)}.xbtn-n:hover{background:#502828}
+
+/* ═ Input ═ */
+.bottom{flex-shrink:0;padding:14px 10%}
+@media(max-width:1200px){.bottom{padding-left:5%;padding-right:5%}}
+.ia-b{background:var(--ibg);border:1px solid var(--bdr);border-radius:18px;padding:10px 10px 12px 16px;display:flex;flex-direction:column;gap:6px;transition:border-color .2s}
+.ia-b:focus-within{border-color:var(--acd)}
+.ia-top{display:flex;align-items:center}
+.mw{position:relative}
+.mbtn{font-family:'IBM Plex Mono',monospace;font-size:9.5px;padding:3px 8px;border:none;border-radius:2px;background:var(--bg3);color:var(--tx2);cursor:pointer;display:flex;align-items:center;gap:4px;user-select:none;transition:color .1s}
+.mbtn:hover{color:var(--ac)}
+.mbtn .arr{font-size:7px;transition:transform .15s}
+.mbtn.open .arr{transform:rotate(180deg)}
+.mdrop{position:absolute;bottom:calc(100% + 4px);left:0;background:var(--bg3);border:1px solid var(--bdr2);border-radius:3px;padding:4px 0;min-width:110px;display:none;z-index:100;box-shadow:0 -4px 16px rgba(0,0,0,.4)}
+.mdrop.open{display:block}
+.mopt{font-family:'IBM Plex Mono',monospace;font-size:10px;padding:6px 14px;color:var(--tx2);cursor:pointer;display:block;width:100%;border:none;background:none;text-align:left;transition:background .08s}
+.mopt:hover{background:var(--bg4);color:var(--w)}
+.mopt.on{color:var(--ac)}
+.ia-row{display:flex;gap:8px;align-items:flex-end}
+#input{flex:1;background:transparent;border:none;padding:2px 0;color:var(--w);font-family:'DM Sans',sans-serif;font-size:14.5px;outline:none;resize:none;min-height:28px;max-height:160px;line-height:1.5}
+#input::placeholder{color:var(--tx3)}
+.sendb{width:36px;height:36px;border-radius:10px;background:var(--acbg);border:1px solid var(--acd);color:var(--ac);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .1s;flex-shrink:0}
+.sendb:hover{background:#2e4450}
+.sendb:disabled{opacity:.2;cursor:not-allowed}
+
+/* ═ Empty ═ */
+.es{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center}
+.es .eo{width:48px;height:48px;border-radius:50%;background:radial-gradient(circle at 35% 35%,var(--ac),#252e38);box-shadow:0 0 30px var(--acd);animation:pl 3s infinite}
+.es h2{font-family:'IBM Plex Mono',monospace;color:var(--ac);font-size:15px;letter-spacing:3px;font-weight:500}
+.es p{color:var(--tx3);font-size:13px;max-width:360px;line-height:1.6}
+
+/* ═ Settings ═ */
+.settings-view{flex:1;display:none;min-width:0;min-height:0}.settings-view.show{display:flex}
+.sv-nav{width:200px;background:var(--bg1);border-right:1px solid var(--bdr);padding:16px 0;flex-shrink:0}
+.sv-back{padding:10px 16px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--tx2);cursor:pointer;display:flex;align-items:center;gap:6px;border-bottom:1px solid var(--bdr);margin-bottom:8px}.sv-back:hover{color:var(--ac)}
+.sv-title{padding:4px 16px 12px;font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--tx3);letter-spacing:2px;text-transform:uppercase}
+.sv-item{padding:9px 16px;font-size:13px;color:var(--tx2);cursor:pointer;border-left:2px solid transparent;transition:all .1s}
+.sv-item:hover{background:var(--bg2);color:var(--tx)}
+.sv-item.on{background:var(--bg2);color:var(--w);border-left-color:var(--ac)}
+.sv-content{flex:1;overflow-y:auto;padding:32px 40px;min-height:0}
+.sv-section{display:none;max-width:600px}.sv-section.show{display:block}
+.sv-section h2{font-size:18px;font-weight:600;color:var(--w);margin-bottom:4px}
+.sv-section .desc{font-size:13px;color:var(--tx2);margin-bottom:24px;line-height:1.6}
+.f-group{margin-bottom:20px}
+.f-label{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--tx2);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px;display:block}
+.f-input{width:100%;background:var(--bg);border:1px solid var(--bdr);border-radius:4px;padding:10px 12px;color:var(--w);font-family:'IBM Plex Mono',monospace;font-size:12.5px;outline:none;transition:border .2s}
+.f-input:focus{border-color:var(--acd)}.f-input::placeholder{color:var(--tx3)}
+.f-hint{font-size:11px;color:var(--tx3);margin-top:5px}
+.f-row{display:flex;align-items:center;gap:10px;margin-top:20px}
+.f-btn{padding:8px 20px;border-radius:4px;border:none;font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:500;cursor:pointer;transition:all .1s}
+.f-btn-p{background:var(--acbg);color:var(--ac);border:1px solid var(--acd)}.f-btn-p:hover{background:#2e4450}
+.f-saved{color:var(--grn);font-family:'IBM Plex Mono',monospace;font-size:11px;opacity:0;transition:opacity .3s}.f-saved.on{opacity:1}
+.info-block{background:var(--bg);border:1px solid var(--bdr);border-radius:4px;padding:14px 16px;margin-bottom:16px;font-size:13px;line-height:1.65}
+.info-block strong{color:var(--w)}
+.info-block code{background:var(--bg3);color:var(--ac);padding:1px 5px;border-radius:3px;font-family:'IBM Plex Mono',monospace;font-size:12px}
+
+/* ═ Modal ═ */
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;z-index:200}
+.modal-bg.on{display:flex}
+.modal{background:var(--bg2);border:1px solid var(--bdr2);border-radius:6px;width:360px;max-width:90vw}
+.modal-bd{padding:20px;font-size:14px;line-height:1.6}
+.modal-ft{padding:12px 20px;border-top:1px solid var(--bdr);display:flex;justify-content:flex-end;gap:8px}
+.m-btn{padding:7px 16px;border-radius:3px;border:none;font-family:'IBM Plex Mono',monospace;font-size:11px;cursor:pointer}
+.m-cancel{background:var(--bg3);color:var(--tx2)}.m-danger{background:#3d1e1e;color:var(--red)}
+
+@media(max-width:650px){.sb{display:none}.sv-nav{width:140px}}
+</style>
+</head>
+<body>
+
+<div class="sb">
+  <div class="sb-hd">
+    <div class="brand"><div class="orb"></div><div><div class="bname">JARVIS</div><div class="bsub">v0.5.1</div></div></div>
+    <div class="sb-btns">
+      <button class="sb-btn" onclick="openSettings()"><svg class="ico" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 1v2.5M12 20.5V24M4.22 4.22l1.77 1.77M18.01 18.01l1.77 1.77M1 12h2.5M20.5 12H24M4.22 19.78l1.77-1.77M18.01 5.99l1.77-1.77"/></svg> Settings</button>
+      <button class="sb-btn" onclick="newC()"><span class="ico">+</span> New chat</button>
+    </div>
+  </div>
+  <div class="cl" id="cl"></div>
+  <div class="sb-ft" onclick="openSettings();navTo('project')"><span class="pdot" id="pd"></span><span id="pl">no project</span></div>
+</div>
+
+<div class="mn">
+  <div class="chat-view" id="chatView">
+    <div class="top"><div class="top-t" id="ct">New conversation</div></div>
+    <div class="ms" id="ms">
+      <div class="es" id="es"><div class="eo"></div><h2>JARVIS</h2><p>Ask anything. Use /help for commands.</p></div>
+    </div>
+    <div class="sbar" id="sbar"><div class="si" id="di"></div><button class="xbtn xbtn-y" onclick="sbc(1)">Apply</button><button class="xbtn xbtn-n" onclick="sbc(0)">Reject</button></div>
+    <div class="bottom"><div class="ia-b">
+      <div class="ia-top"><div class="mw" id="mw">
+        <button class="mbtn" id="mbtn" onclick="toggleDrop()"><span id="mlab">auto</span><span class="arr">▲</span></button>
+        <div class="mdrop" id="mdrop">
+          <button class="mopt on" data-m="" onclick="pickM(this)">auto</button>
+          <button class="mopt" data-m="!!simple " onclick="pickM(this)">simple</button>
+          <button class="mopt" data-m="!!medium " onclick="pickM(this)">medium</button>
+          <button class="mopt" data-m="!!hard " onclick="pickM(this)">hard</button>
+          <button class="mopt" data-m="!!deep " onclick="pickM(this)">deep</button>
+          <button class="mopt" data-m="!!compute " onclick="pickM(this)">compute</button>
+          <button class="mopt" data-m="!!image " onclick="pickM(this)">image</button>
+          <button class="mopt" data-m="!!deepcode " onclick="pickM(this)">deep code</button>
+        </div>
+      </div></div>
+      <div class="ia-row">
+        <textarea id="input" rows="1" placeholder="Message JARVIS..." autofocus></textarea>
+        <button class="sendb" id="sB" onclick="sendOrStop()">
+          <svg id="sendIcon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9Z"/></svg>
+          <svg id="stopIcon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="display:none"><path d="M18 6L6 18"/><path d="M6 6L18 18"/></svg>
+        </button>
+      </div>
+    </div></div>
+  </div>
+
+  <div class="settings-view" id="settingsView">
+    <div class="sv-nav">
+      <div class="sv-back" onclick="closeSettings()">← Back to chat</div>
+      <div class="sv-title">Settings</div>
+      <div class="sv-item on" data-s="apikeys" onclick="navTo('apikeys')">API Keys</div>
+      <div class="sv-item" data-s="project" onclick="navTo('project')">Project</div>
+      <div class="sv-item" data-s="models" onclick="navTo('models')">Models</div>
+      <div class="sv-item" data-s="sandbox" onclick="navTo('sandbox')">Sandbox</div>
+      <div class="sv-item" data-s="about" onclick="navTo('about')">About</div>
+    </div>
+    <div class="sv-content">
+      <div class="sv-section show" id="sec-apikeys"><h2>API Keys</h2><p class="desc">Saved to <code>~/.jarvis/settings.json</code></p>
+        <div class="f-group"><label class="f-label">NVIDIA API Key</label><input class="f-input" id="sk_nvidia" placeholder="nvapi-..." spellcheck="false"><div class="f-hint">Free at build.nvidia.com</div></div>
+        <div class="f-group"><label class="f-label">Groq API Key</label><input class="f-input" id="sk_groq" placeholder="gsk_..." spellcheck="false"><div class="f-hint">Free at console.groq.com</div></div>
+        <div class="f-group"><label class="f-label">Gemini API Key</label><input class="f-input" id="sk_gemini" placeholder="AIza..." spellcheck="false"><div class="f-hint">Free at aistudio.google.com</div></div>
+        <div class="f-group"><label class="f-label">Gemini Multi-Key</label><input class="f-input" id="sk_gemini_multi" placeholder="key1,key2,key3" spellcheck="false"><div class="f-hint">Comma-separated — multiplies rate limits</div></div>
+        <div class="f-group"><label class="f-label">OpenRouter API Key</label><input class="f-input" id="sk_openrouter" placeholder="sk-or-..." spellcheck="false"><div class="f-hint">Free at openrouter.ai — optional, for future use</div></div>
+        <div class="f-row"><button class="f-btn f-btn-p" onclick="saveKeys()">Save</button><span class="f-saved" id="keysSaved">✓ Saved</span></div>
+      </div>
+      <div class="sv-section" id="sec-project"><h2>Project</h2><p class="desc">Working directory for coding agent.</p>
+        <div class="f-group"><label class="f-label">Path</label><input class="f-input" id="pm_project" placeholder="/home/user/project" spellcheck="false"></div>
+        <div class="f-row"><button class="f-btn f-btn-p" onclick="saveProject()">Set Project</button><span class="f-saved" id="projSaved">✓ Saved</span></div>
+      </div>
+      <div class="sv-section" id="sec-models"><h2>Models</h2><p class="desc">Free models used by JARVIS.</p>
+        <div class="info-block"><strong>NVIDIA NIM</strong> — DeepSeek V3.2, MiniMax M2.5, Qwen 3.5, GLM-5, Nemotron Super, SD3</div>
+        <div class="info-block"><strong>Groq</strong> — Kimi K2, Llama 4 Scout, GPT-OSS 120B, Llama 3.1 8B</div>
+        <div class="info-block"><strong>Gemini</strong> — Flash Lite, 2.5 Flash, 2.5 Pro, 3.1 Pro</div>
+      </div>
+      <div class="sv-section" id="sec-sandbox"><h2>Sandbox</h2><p class="desc">How code editing works.</p>
+        <div class="info-block">Edits in <code>.jarvis_sandbox/</code> — originals untouched until Apply.</div>
+        <div class="info-block"><code>/index</code> scans your project. Maps in <code>.jarvis/maps/</code>.</div>
+      </div>
+      <div class="sv-section" id="sec-about"><h2>About</h2><div class="info-block">JARVIS v0.5.1 — Multi-brain AI agent. Modes: auto, simple, medium, hard, deep, compute, prove, image.</div></div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="confirmModal">
+  <div class="modal"><div class="modal-bd" id="confirmText"></div>
+    <div class="modal-ft"><button class="m-btn m-cancel" onclick="closeModal()">Cancel</button><button class="m-btn m-danger" id="confirmOk">Delete</button></div>
+  </div>
+</div>
+
+<script>
+let ws,px='';
+const $=id=>document.getElementById(id);
+
+// ── Thinking state ──
+let thinkId=0;       // unique id per thinking block
+let curThink=null;   // {id, el, calls:[], expanded:false, openIdx:-1}
+
+function co(){
+  const p=location.protocol==='https:'?'wss:':'ws:';
+  ws=new WebSocket(`${p}//${location.host}/ws`);
+  ws.onclose=()=>setTimeout(co,2e3);
+  ws.onmessage=e=>h(JSON.parse(e.data));
+}
+
+function h(d){
+  switch(d.type){
+    case'init':
+      if(d.project){$('pl').textContent=d.project.split('/').pop();$('pd').classList.add('on')}
+      renderCL(d.conversations||{},d.active||'');
+      if(d.history&&d.history.length){clearMs();d.history.forEach(m=>aM(m.role,m.role==='user'?stripPrefix(m.text):m.text))}
+      break;
+    case'conv_list':
+      renderCL(d.conversations||{},d.active||'');clearMs();
+      if(d.history&&d.history.length)d.history.forEach(m=>aM(m.role,m.role==='user'?stripPrefix(m.text):m.text));else showEmpty();
+      if(d.active&&d.conversations[d.active])$('ct').textContent=d.conversations[d.active];
+      break;
+    case'conv_renamed':{const el=document.querySelector(`[data-c="${d.id}"] .n`);if(el)el.textContent=d.name}break;
+    case'response':finishThink();d.is_system?aM('system',d.text):aM('assistant',d.text);break;
+
+    // ── Thinking ──
+    case'thinking_start':{
+      thinkId++;
+      const tid=thinkId;
+      const el=document.createElement('div');
+      el.className='think-block';el.dataset.tid=tid;
+      el.innerHTML=`<div class="think-sum" data-tid="${tid}"><div class="think-pulse on"></div><span class="think-text">JARVIS is thinking...</span><span class="think-arrow">▼</span></div><div class="think-calls"></div>`;
+      el.querySelector('.think-sum').onclick=()=>toggleExp(tid);
+      $('ms').appendChild(el);scrollMs();
+      curThink={id:tid,el,calls:[],expanded:false,openIdx:-1};
+      allThinks[tid]=curThink;
+      setThinkingBtn(true);
+    }break;
+
+    case'thinking_end':finishThink();break;
+
+    case'thinking_header':{
+      if(!curThink)break;
+      // Mark previous call done
+      if(curThink.calls.length)curThink.calls[curThink.calls.length-1].status='done';
+      curThink.calls.push({name:d.model,label:d.label||'',chunks:[],status:'active'});
+      const txt=curThink.el.querySelector('.think-text');
+      const last=curThink.calls[curThink.calls.length-1];
+      txt.textContent=last.name+(last.label?' · '+last.label:'');
+      rebuildCalls(curThink);scrollMs();
+    }break;
+
+    case'thinking_chunk':{
+      if(!curThink||!curThink.calls.length)break;
+      const last=curThink.calls[curThink.calls.length-1];
+      last.chunks.push(d.chunk);
+      // Stream to open content if this call is open
+      const idx=curThink.calls.length-1;
+      if(curThink.openIdx===idx){
+        const cel=curThink.el.querySelector('.tc-content-'+idx);
+        if(cel){cel.textContent+=d.chunk;cel.scrollTop=cel.scrollHeight}
+      }
+    }break;
+
+    case'status':{
+      if(curThink){
+        const txt=curThink.el.querySelector('.think-text');
+        if(txt)txt.textContent=d.text;
+      }
+    }break;
+
+    case'sandbox_prompt':$('sbar').classList.add('on');$('di').textContent=d.diff.substring(0,140);break;
+    case'project_update':$('pl').textContent=d.project?d.project.split('/').pop():'no project';$('pd').classList.toggle('on',!!d.project);break;
+    case'settings':$('sk_nvidia').value=d.values.NVIDIA_API_KEY||'';$('sk_groq').value=d.values.GROQ_API_KEY||'';$('sk_gemini').value=d.values.GEMINI_API_KEY||'';$('sk_gemini_multi').value=d.values.GEMINI_API_KEYS||'';$('sk_openrouter').value=d.values.OPENROUTER_API_KEY||'';if(d.project)$('pm_project').value=d.project;break;
+    case'settings_saved':flash('keysSaved');break;
+  }
+}
+
+// ── Thinking: self-contained per block ──
+// Store all blocks so they stay interactive after response
+const allThinks={};
+
+function toggleExp(tid){
+  const t=allThinks[tid];if(!t)return;
+  t.expanded=!t.expanded;
+  t.el.querySelector('.think-sum').classList.toggle('exp',t.expanded);
+  t.el.querySelector('.think-calls').classList.toggle('open',t.expanded);
+}
+
+function toggleCall(tid,idx){
+  const t=allThinks[tid];if(!t)return;
+  t.openIdx=t.openIdx===idx?-1:idx;
+  rebuildCalls(t);
+  if(t.openIdx>=0){
+    const cel=t.el.querySelector('.tc-content-'+t.openIdx);
+    if(cel)cel.scrollTop=cel.scrollHeight;
+  }
+}
+
+function rebuildCalls(t){
+  const c=t.el.querySelector('.think-calls');c.innerHTML='';
+  t.calls.forEach((call,i)=>{
+    const item=document.createElement('div');item.className='tc-item';
+    item.innerHTML=`<div class="tc-dot ${call.status==='active'?'active':'done'}"></div><span class="tc-name${t.openIdx===i?' open':''}">${E(call.name)}${call.label?' · '+E(call.label):''}</span>`;
+    item.onclick=(e)=>{e.stopPropagation();toggleCall(t.id,i)};
+    c.appendChild(item);
+    const content=document.createElement('div');
+    content.className='tc-content tc-content-'+i+(t.openIdx===i?' open':'');
+    content.textContent=call.chunks.join('');
+    c.appendChild(content);
+  });
+}
+
+function finishThink(){
+  if(!curThink)return;
+  curThink.calls.forEach(c=>c.status='done');
+  const p=curThink.el.querySelector('.think-pulse');if(p)p.classList.remove('on');
+  const txt=curThink.el.querySelector('.think-text');
+  if(txt)txt.textContent=curThink.calls.length+' calls';
+  rebuildCalls(curThink);
+  curThink=null;
+  setThinkingBtn(false);
+}
+
+// ── Messages ──
+function renderCL(c,a){const l=$('cl');l.innerHTML='';const entries=Object.entries(c).reverse();for(const[id,nm]of entries){const el=document.createElement('div');el.className='ci'+(id===a?' on':'');el.dataset.c=id;el.innerHTML=`<span class="n">${E(nm)}</span><button class="d" onclick="event.stopPropagation();confirmDel('${id}')">✕</button>`;el.onclick=()=>ws.send(JSON.stringify({action:'switch_conversation',id}));l.appendChild(el)}}
+function clearMs(){$('ms').innerHTML='';curThink=null;for(const k in allThinks)delete allThinks[k]}
+function showEmpty(){$('ms').innerHTML='<div class="es" id="es"><div class="eo"></div><h2>JARVIS</h2><p>Ask anything.</p></div>'}
+function scrollMs(){$('ms').scrollTop=$('ms').scrollHeight}
+
+function aM(role,text){
+  const c=$('ms');const es=c.querySelector('.es');if(es)es.remove();let el;
+  if(role==='system'){el=document.createElement('div');el.className='ms-sys';el.textContent=text}
+  else if(role==='user'){el=document.createElement('div');el.className='mu';el.innerHTML=`<div class="mu-in">${E(text)}</div>`}
+  else{
+    el=document.createElement('div');el.className='ma';
+    // Check if response is an image path
+    const trimmed=text.replace(/\033\[[0-9;]*m/g,'').trim();
+    const isImage=/\.(png|jpg|jpeg|gif|webp)$/i.test(trimmed) && trimmed.includes('/');
+    if(isImage){
+      const fname=trimmed.split('/').pop();
+      const imgUrl='/images/'+fname;
+      el.innerHTML=`<div class="jl"><div class="jd"></div>JARVIS</div><img src="${imgUrl}" alt="Generated image" style="max-width:100%;border-radius:6px;margin-top:4px" onerror="this.outerHTML='<p>Image saved: ${E(trimmed)}</p>'">`;
+    }else{
+      el.innerHTML=`<div class="jl"><div class="jd"></div>JARVIS</div>${rM(text)}`;
+    }
+  }
+  c.appendChild(el);scrollMs();
+}
+
+function rM(t){
+  t=t.replace(/\033\[[0-9;]*m/g,'');
+  t=t.replace(/```(\w*)\n([\s\S]*?)```/g,(_,l,c)=>`<pre><code>${E(c.trim())}</code></pre>`);
+  t=t.replace(/`([^`]+)`/g,'<code>$1</code>');
+  t=t.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
+  t=t.replace(/(?<!\w)\*(.+?)\*(?!\w)/g,'<em>$1</em>');
+  t=t.replace(/^> (.+)$/gm,'<blockquote>$1</blockquote>');
+  t=t.replace(/^### (.+)$/gm,'<h3>$1</h3>');t=t.replace(/^## (.+)$/gm,'<h2>$1</h2>');t=t.replace(/^# (.+)$/gm,'<h1>$1</h1>');
+  t=t.split(/\n{2,}/).map(p=>{p=p.trim();if(!p||p.startsWith('<'))return p;return`<p>${p.replace(/\n/g,'<br>')}</p>`}).join('');
+  return t;
+}
+function E(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+function flash(id){$(id).classList.add('on');setTimeout(()=>$(id).classList.remove('on'),2500)}
+
+let isThinking=false;
+function sendOrStop(){
+  if(isThinking){stopThink()}else{snd()}
+}
+const MODE_PREFIXES=['!!deepcode ','!!simple ','!!medium ','!!hard ','!!deep ','!!conjecture ','!!compute ','!!prove ','!!image '];
+function stripPrefix(t){const tl=t.toLowerCase();for(const p of MODE_PREFIXES){if(tl.startsWith(p))return t.slice(p.length).trim()}return t}
+function snd(){const i=$('input'),t=(px+i.value).trim();if(!t||!ws||ws.readyState!==1)return;aM('user',stripPrefix(i.value.trim()));ws.send(JSON.stringify({action:'message',text:t}));i.value='';i.style.height='auto';setThinkingBtn(true)}
+function stopThink(){if(ws&&ws.readyState===1)ws.send(JSON.stringify({action:'stop'}));setThinkingBtn(false)}
+function setThinkingBtn(thinking){
+  isThinking=thinking;
+  const btn=$('sB'),si=$('sendIcon'),xi=$('stopIcon');
+  btn.disabled=false;
+  if(thinking){si.style.display='none';xi.style.display='block'}
+  else{si.style.display='block';xi.style.display='none'}
+}
+
+function toggleDrop(){$('mdrop').classList.toggle('open');$('mbtn').classList.toggle('open')}
+function pickM(el){document.querySelectorAll('.mopt').forEach(e=>e.classList.remove('on'));el.classList.add('on');px=el.dataset.m;$('mlab').textContent=el.textContent;$('mdrop').classList.remove('open');$('mbtn').classList.remove('open')}
+document.addEventListener('click',e=>{if(!$('mw').contains(e.target)){$('mdrop').classList.remove('open');$('mbtn').classList.remove('open')}});
+
+function sbc(ok){if(ws)ws.send(JSON.stringify({action:'sandbox_confirm',confirm:!!ok}));$('sbar').classList.remove('on')}
+function newC(){if(ws&&ws.readyState===1)ws.send(JSON.stringify({action:'new_conversation'}))}
+function confirmDel(id){$('confirmText').textContent='Delete this conversation?';$('confirmOk').onclick=()=>{ws.send(JSON.stringify({action:'delete_conversation',id}));closeModal()};$('confirmModal').classList.add('on')}
+function closeModal(){$('confirmModal').classList.remove('on')}
+$('confirmModal').addEventListener('click',e=>{if(e.target===$('confirmModal'))closeModal()});
+
+function openSettings(){$('chatView').classList.add('hide');$('settingsView').classList.add('show');if(ws)ws.send(JSON.stringify({action:'get_settings'}))}
+function closeSettings(){$('settingsView').classList.remove('show');$('chatView').classList.remove('hide')}
+function navTo(s){document.querySelectorAll('.sv-item').forEach(i=>i.classList.toggle('on',i.dataset.s===s));document.querySelectorAll('.sv-section').forEach(sec=>sec.classList.toggle('show',sec.id==='sec-'+s))}
+function saveKeys(){if(!ws)return;ws.send(JSON.stringify({action:'save_settings',settings:{NVIDIA_API_KEY:$('sk_nvidia').value,GROQ_API_KEY:$('sk_groq').value,GEMINI_API_KEY:$('sk_gemini').value,GEMINI_API_KEYS:$('sk_gemini_multi').value,OPENROUTER_API_KEY:$('sk_openrouter').value}}));flash('keysSaved')}
+function saveProject(){const p=$('pm_project').value.trim();if(p&&ws)ws.send(JSON.stringify({action:'set_project',path:p}));flash('projSaved')}
+
+const inp=$('input');
+inp.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();if(!isThinking)snd()}});
+inp.addEventListener('input',()=>{inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeight,160)+'px'});
+co();
+</script>
+</body>
+</html>

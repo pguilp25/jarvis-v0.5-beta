@@ -1,4 +1,4 @@
-# JARVIS v0.5.1 — Multi-Brain AI Agent
+# JARVIS v0.7
 
 ### Opus-level performance. $0/month.
 
@@ -315,4 +315,3 @@ The goal: **frontier-level AI for everyone, for free.** We're not there 100% yet
 
 ## License
 
-MIT

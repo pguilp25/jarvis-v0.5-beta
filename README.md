@@ -314,4 +314,4 @@ The goal: **frontier-level AI for everyone, for free.** We're not there 100% yet
 ---
 
 ## License
-
+GPL

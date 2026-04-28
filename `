@@ -1,0 +1,58 @@
+"""STEP 4: Verify persistence round-trip for thinking_trace field.
+
+Confirms that ConversationMemory.to_dict() and from_dict() correctly
+serialize/deserialize the thinking_trace field stored in message entries.
+"""
+import pytest
+from core.memory import ConversationMemory
+
+
+def test_thinking_trace_round_trip():
+    """Verify thinking_trace survives serialization/deserialization."""
+    memory = ConversationMemory()
+    
+    # Add entries with and without thinking_trace
+    memory.add("user", "Hello")
+    memory.add("assistant", "Hi there", thinking_trace="Let me think about this...")
+    memory.add("assistant", "No thinking here")
+    memory.add("assistant", "Another response", thinking_trace="Step 1: analyze\nStep 2: respond")
+    
+    # Serialize
+    data = memory.to_dict()
+    
+    # Deserialize into a new instance
+    restored = ConversationMemory.from_dict(data)
+    
+    # Verify the full history is preserved
+    assert len(restored.full_history) == 4
+    
+    # Entry 0: no thinking_trace
+    assert restored.full_history[0]["role"] == "user"
+    assert "thinking_trace" not in restored.full_history[0] or restored.full_history[0].get("thinking_trace") == ""
+    
+    # Entry 1: has thinking_trace
+    assert restored.full_history[1]["role"] == "assistant"
+    assert restored.full_history[1]["thinking_trace"] == "Let me think about this..."
+    
+    # Entry 2: no thinking_trace
+    assert restored.full_history[2]["role"] == "assistant"
+    assert "thinking_trace" not in restored.full_history[2] or restored.full_history[2].get("thinking_trace") == ""
+    
+    # Entry 3: has multi-line thinking_trace
+    assert restored.full_history[3]["role"] == "assistant"
+    assert restored.full_history[3]["thinking_trace"] == "Step 1: analyze\nStep 2: respond"
+
+
+def test_thinking_trace_preserved_in_serialized_dict():
+    """Verify to_dict() output contains thinking_trace keys."""
+    memory = ConversationMemory()
+    memory.add("assistant", "response", thinking_trace="inner monologue")
+    
+    data = memory.to_dict()
+    
+    # The serialized full_history should contain the thinking_trace key
+    assert "full_history" in data
+    assert len(data["full_history"]) == 1
+    entry = data["full_history"][0]
+    assert "thinking_trace" in entry
+    assert entry["thinking_trace"] == "inner monologue"

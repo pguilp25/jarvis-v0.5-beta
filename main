@@ -1,0 +1,1 @@
+d = {"history": mem.full_history, "compressed": mem.compressed_context}

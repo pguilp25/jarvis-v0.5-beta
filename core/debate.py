@@ -220,7 +220,7 @@ async def full_debate(
     debating()
     prompt_to_show = original_prompt or question
     models = [
-        "nvidia/deepseek-v3.2",
+        "nvidia/deepseek-v4-pro",
         "nvidia/glm-5",
         "nvidia/minimax-m2.5",
         "nvidia/qwen-3.5",

@@ -41,7 +41,7 @@ ATTEMPT_LOG_LIMIT = 12_000  # Larger for compute (code snippets + outputs)
 MAX_CYCLES = 100
 
 ALL_NVIDIA = [
-    "nvidia/deepseek-v3.2",
+    "nvidia/deepseek-v4-pro",
     "nvidia/glm-5",
     "nvidia/minimax-m2.5",
     "nvidia/qwen-3.5",

@@ -19,7 +19,7 @@ class ConversationMemory:
         self.compression_running: bool = False
         self._msg_counter: int = 0
 
-    def add(self, role: str, content: str, notes: str = ""):
+    def add(self, role: str, content: str, notes: str = "", thinking_trace: str = ""):
         """Add a raw message with timestamp, number, and optional context notes."""
         self._msg_counter += 1
         entry = {
@@ -30,6 +30,8 @@ class ConversationMemory:
         }
         if notes:
             entry["notes"] = notes
+        if thinking_trace:
+            entry["thinking_trace"] = thinking_trace
         self.full_history.append(entry)
 
     def get_ai_context(self) -> str:

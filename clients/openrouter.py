@@ -99,6 +99,9 @@ async def call_openrouter_stream(
     }
 
     full = ""
+    # stop_check must only see VISIBLE content (no <think> block).
+    visible = ""
+    in_thinking = False
     async with aiohttp.ClientSession() as session:
         async with session.post(OPENROUTER_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=600)) as resp:
             if resp.status != 200:
@@ -115,13 +118,30 @@ async def call_openrouter_stream(
                 try:
                     data = _json.loads(data_str)
                     delta = data.get("choices", [{}])[0].get("delta", {})
-                    chunk = delta.get("content", "")
+                    reasoning = delta.get("reasoning") or delta.get("reasoning_content") or ""
+                    if reasoning:
+                        if not in_thinking:
+                            full += "<think>"
+                            thought_logger.write_chunk(model_id, "<think>")
+                            in_thinking = True
+                        full += reasoning
+                        thought_logger.write_chunk(model_id, reasoning)
+                    chunk = delta.get("content") or ""
                     if chunk:
+                        if in_thinking:
+                            full += "</think>\n\n"
+                            thought_logger.write_chunk(model_id, "</think>\n\n")
+                            in_thinking = False
                         full += chunk
+                        visible += chunk
                         thought_logger.write_chunk(model_id, chunk)
-                        if stop_check and stop_check(full):
-                            break
+                        if stop_check and ("]" in chunk or "\n" in chunk):
+                            if stop_check(visible):
+                                break
                 except _json.JSONDecodeError:
                     continue
+            if in_thinking:
+                full += "</think>\n\n"
+                thought_logger.write_chunk(model_id, "</think>\n\n")
 
     return full

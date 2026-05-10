@@ -199,6 +199,21 @@ def _extract_notes(answer: str) -> tuple[str, str]:
     return answer, ""
 
 
+def _extract_thinking(text: str) -> tuple[str, str]:
+    """Extract <think>...</think> blocks from response text.
+    Returns (clean_text, thinking_trace).
+    """
+    import re
+    thinking_parts = []
+    # Match <think>...</think> blocks (the streaming clients use these markers)
+    pattern = r'<think>(.*?)</think>'
+    matches = re.findall(pattern, text, re.DOTALL)
+    if matches:
+        thinking_parts = [m.strip() for m in matches if m.strip()]
+        clean = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+        return clean, "\n\n".join(thinking_parts)
+    return text, ""
+
 # ─── Main Pipeline ───────────────────────────────────────────────────────────
 
 async def process_turn(user_input: str, memory: ConversationMemory) -> str:
@@ -331,14 +346,16 @@ async def process_turn(user_input: str, memory: ConversationMemory) -> str:
             # Self-eval the quick answer
             eval_result = await self_eval(query, fast_result["quick_answer"], complexity=1)
             if eval_result["passed"]:
-                clean, notes = _extract_notes(fast_result["quick_answer"])
+                raw_quick = fast_result["quick_answer"]
+                raw_clean_ft, thinking_trace_ft = _extract_thinking(raw_quick)
+                clean, notes = _extract_notes(raw_clean_ft)
                 answer = await format_output(clean)
                 confidence.record("1/1", 1)
                 conf = confidence.get_statement("1/1", 1)
                 if conf:
                     answer += f"\n\n{conf}"
                 memory.add("user", user_input_display)
-                memory.add("assistant", answer, notes=notes)
+                memory.add("assistant", raw_clean_ft, notes=notes, thinking_trace=thinking_trace_ft)
                 save_session(memory)
                 return answer
 
@@ -424,7 +441,8 @@ async def process_turn(user_input: str, memory: ConversationMemory) -> str:
             )
             try:
                 memory.add("user", user_input_display)
-                memory.add("assistant", f"[IMAGE: {img_ctx['filepath']}]", notes=notes)
+                _, img_thinking = _extract_thinking(answer)
+                memory.add("assistant", f"[IMAGE: {img_ctx['filepath']}]", notes=notes, thinking_trace=img_thinking)
                 save_session(memory)
             except Exception as e:
                 warn(f"Memory save failed: {e}")
@@ -446,7 +464,8 @@ async def process_turn(user_input: str, memory: ConversationMemory) -> str:
         # Save to memory (raw, no formatting)
         try:
             memory.add("user", user_input_display)
-            memory.add("assistant", raw_output, notes="- Lean proof (compiler-verified, bypassed self-eval)")
+            clean_proof, proof_thinking = _extract_thinking(raw_output)
+            memory.add("assistant", clean_proof, notes="- Lean proof (compiler-verified, bypassed self-eval)", thinking_trace=proof_thinking)
             save_session(memory)
         except Exception as e:
             warn(f"Memory save failed: {e}")
@@ -482,26 +501,26 @@ async def process_turn(user_input: str, memory: ConversationMemory) -> str:
             if not eval2["passed"]:
                 warn("Self-eval failed again — accepting answer")
 
+    # ── Extract thinking trace from RAW answer (before formatting strips ◫...◎ markers)
+    raw_clean, thinking_trace = _extract_thinking(answer)
     # ── Format + output (crash-proof — NEVER lose the answer) ─────────
     notes = ""
     try:
-        clean_answer, notes = _extract_notes(answer)
+        clean_answer, notes = _extract_notes(raw_clean)
         formatted = await format_output(clean_answer)
         conf = state.get("confidence", "")
         if conf:
             formatted += f"\n\n{conf}"
     except Exception as e:
         warn(f"Post-processing failed ({e}) — returning raw answer")
-        formatted = answer
-
+        formatted = raw_clean
     # ── Add RAW to full_history ──────────────────────────────────────────
     try:
         memory.add("user", user_input_display)
-        memory.add("assistant", formatted, notes=notes)
+        memory.add("assistant", raw_clean, notes=notes, thinking_trace=thinking_trace)
         save_session(memory)
     except Exception as e:
         warn(f"Memory save failed: {e}")
-
     return formatted
 
 

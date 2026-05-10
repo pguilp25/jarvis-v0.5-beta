@@ -280,10 +280,13 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--tx);heigh
 <script>
 let ws,px='';
 const $=id=>document.getElementById(id);
+let activeConvId='';      // which conversation the UI is currently showing
+let processingConvId='';  // which conversation is currently being processed
 
 // ── Thinking state ──
-let thinkId=0;       // unique id per thinking block
-let curThink=null;   // {id, el, calls:[], expanded:false, openIdx:-1}
+let thinkId=0; // unique id per thinking block
+let curThink=null; // {id, el, calls:[], expanded:false, openIdx:-1}
+const thinkingBuffers = {}; // per-conversation buffer for non-active convs
 
 function co(){
   const p=location.protocol==='https:'?'wss:':'ws:';
@@ -293,22 +296,34 @@ function co(){
 }
 
 function h(d){
+  const cvid=d.conv_id||''; // conversation id from broadcast
   switch(d.type){
     case'init':
       if(d.project){$('pl').textContent=d.project.split('/').pop();$('pd').classList.add('on')}
+      activeConvId=d.active||'';
+      processingConvId=d.processing||'';
       renderCL(d.conversations||{},d.active||'');
-      if(d.history&&d.history.length){clearMs();d.history.forEach(m=>aM(m.role,m.role==='user'?stripPrefix(m.text):m.text))}
+      if(d.history&&d.history.length){clearMs();d.history.forEach(m=>aM(m.role,m.role==='user'?stripPrefix(m.text):m.text,m.thinking_trace||''));const sb=d.thinking_buffer;const fb=thinkingBuffers[activeConvId];if(fb){replayThinking(fb);delete thinkingBuffers[activeConvId]}else if(sb&&sb.headers&&sb.headers.length){replayThinking(sb)}}
+      if(processingConvId&&processingConvId===activeConvId)setThinkingBtn(true);
       break;
     case'conv_list':
+      activeConvId=d.active||'';
+      processingConvId=d.processing||'';
       renderCL(d.conversations||{},d.active||'');clearMs();
-      if(d.history&&d.history.length)d.history.forEach(m=>aM(m.role,m.role==='user'?stripPrefix(m.text):m.text));else showEmpty();
+      if(d.history&&d.history.length)d.history.forEach(m=>aM(m.role,m.role==='user'?stripPrefix(m.text):m.text,m.thinking_trace||''));else showEmpty();
+      {const sb=d.thinking_buffer;const fb=thinkingBuffers[activeConvId];if(fb){replayThinking(fb);delete thinkingBuffers[activeConvId]}else if(sb&&sb.headers&&sb.headers.length){replayThinking(sb)}}
       if(d.active&&d.conversations[d.active])$('ct').textContent=d.conversations[d.active];
+      if(processingConvId&&processingConvId===activeConvId)setThinkingBtn(true);
+      else setThinkingBtn(false);
       break;
     case'conv_renamed':{const el=document.querySelector(`[data-c="${d.id}"] .n`);if(el)el.textContent=d.name}break;
-    case'response':finishThink();d.is_system?aM('system',d.text):aM('assistant',d.text);break;
+    case'response':
+      if(cvid&&cvid!==activeConvId){processingConvId='';setThinkingBtn(false);break;}
+      finishThink();d.is_system?aM('system',d.text):aM('assistant',d.text);break;
 
     // ── Thinking ──
     case'thinking_start':{
+      if(cvid&&cvid!==activeConvId){thinkingBuffers[cvid]={headers:[],chunks:[],done:false,curIdx:-1};break;}
       thinkId++;
       const tid=thinkId;
       const el=document.createElement('div');
@@ -321,9 +336,12 @@ function h(d){
       setThinkingBtn(true);
     }break;
 
-    case'thinking_end':finishThink();break;
+    case'thinking_end':
+      if(cvid&&cvid!==activeConvId){if(thinkingBuffers[cvid])thinkingBuffers[cvid].done=true;processingConvId='';setThinkingBtn(false);break;}
+      finishThink();break;
 
     case'thinking_header':{
+      if(cvid&&cvid!==activeConvId){if(thinkingBuffers[cvid]){thinkingBuffers[cvid].headers.push({model:d.model,label:d.label||''});thinkingBuffers[cvid].curIdx=thinkingBuffers[cvid].headers.length-1;thinkingBuffers[cvid].chunks.push([])}break;}
       if(!curThink)break;
       // Mark previous call done
       if(curThink.calls.length)curThink.calls[curThink.calls.length-1].status='done';
@@ -335,11 +353,23 @@ function h(d){
     }break;
 
     case'thinking_chunk':{
+      if(cvid&&cvid!==activeConvId){
+        const buf=thinkingBuffers[cvid];
+        if(buf){
+          // Route to most recent slot with matching model name, not curIdx.
+          // curIdx is overwritten by each parallel model's header — all chunks
+          // would end up in the last model's slot without this fix.
+          let ti=buf.curIdx;
+          for(let i=buf.headers.length-1;i>=0;i--){if(buf.headers[i].model===d.model){ti=i;break;}}
+          if(ti>=0&&buf.chunks[ti])buf.chunks[ti].push(d.chunk);
+        }
+        break;
+      }
       if(!curThink||!curThink.calls.length)break;
-      const last=curThink.calls[curThink.calls.length-1];
-      last.chunks.push(d.chunk);
-      // Stream to open content if this call is open
-      const idx=curThink.calls.length-1;
+      // Route to the most recent call slot with matching model name.
+      let idx=curThink.calls.length-1;
+      for(let i=curThink.calls.length-1;i>=0;i--){if(curThink.calls[i].name===d.model){idx=i;break;}}
+      curThink.calls[idx].chunks.push(d.chunk);
       if(curThink.openIdx===idx){
         const cel=curThink.el.querySelector('.tc-content-'+idx);
         if(cel){cel.textContent+=d.chunk;cel.scrollTop=cel.scrollHeight}
@@ -347,6 +377,7 @@ function h(d){
     }break;
 
     case'status':{
+      if(cvid&&cvid!==activeConvId)break;
       if(curThink){
         const txt=curThink.el.querySelector('.think-text');
         if(txt)txt.textContent=d.text;
@@ -406,14 +437,91 @@ function finishThink(){
   setThinkingBtn(false);
 }
 
+function replayThinkingBuffer(cvid,history){
+  if(!cvid)return;
+  // Replay from server-provided thinking_buffer (page-refresh case)
+  if(history&&history.length){
+    const lastMsg=history[history.length-1];
+    if(lastMsg&&lastMsg.thinking_buffer&&lastMsg.thinking_buffer.length){
+      lastMsg.thinking_buffer.forEach(ev=>{
+        if(ev.type==='thinking_start')h({type:'thinking_start',conv_id:cvid});
+        else if(ev.type==='thinking_header')h({type:'thinking_header',conv_id:cvid,model:ev.model,label:ev.label||''});
+        else if(ev.type==='thinking_chunk')h({type:'thinking_chunk',conv_id:cvid,chunk:ev.chunk});
+        else if(ev.type==='thinking_end')h({type:'thinking_end',conv_id:cvid});
+      });
+    }
+  }
+  // Replay from local buffer (real-time events while conv was inactive)
+  const buf=thinkingBuffers[cvid];
+  if(!buf)return;
+  delete thinkingBuffers[cvid];
+  h({type:'thinking_start',conv_id:cvid});
+  buf.headers.forEach((hdr,i)=>{
+    h({type:'thinking_header',conv_id:cvid,model:hdr.model,label:hdr.label||''});
+    if(buf.chunks[i])buf.chunks[i].forEach(chunk=>h({type:'thinking_chunk',conv_id:cvid,model:hdr.model,chunk:chunk}));
+  });
+  if(buf.done)h({type:'thinking_end',conv_id:cvid});
+}
+
+function replayThinking(buffer){
+    if(!buffer||!buffer.headers)return;
+    thinkId++;
+    const tid=thinkId;
+    const el=document.createElement('div');
+    el.className='think-block';el.dataset.tid=tid;
+    el.innerHTML=`<div class="think-sum" data-tid="${tid}"><div class="think-pulse${buffer.done?'':' on'}"></div><span class="think-text">JARVIS is thinking...</span><span class="think-arrow">▼</span></div><div class="think-calls"></div>`;
+    el.querySelector('.think-sum').onclick=()=>toggleExp(tid);
+    $('ms').appendChild(el);scrollMs();
+    const calls=buffer.headers.map(hdr=>({name:hdr.model,label:hdr.label||'',chunks:[],status:'active'}));
+    const tObj={id:tid,el,calls,expanded:false,openIdx:-1};
+    allThinks[tid]=tObj;
+    // Replay chunks into corresponding calls
+    // buffer.chunks is either: array of arrays (per-call) or flat array (legacy)
+    if(buffer.chunks.length&&Array.isArray(buffer.chunks[0])){
+        // Per-call chunks: chunks[i] belongs to calls[i]
+        calls.forEach((c,i)=>{if(buffer.chunks[i])c.chunks=buffer.chunks[i].slice()});
+    }else{
+        // Flat chunks: all belong to the last call (legacy fallback)
+        if(calls.length)calls[calls.length-1].chunks=buffer.chunks.slice();
+    }
+    if(buffer.done){
+        calls.forEach(c=>c.status='done');
+        const p=el.querySelector('.think-pulse');if(p)p.classList.remove('on');
+        const txt=el.querySelector('.think-text');if(txt)txt.textContent=calls.length+' calls';
+        curThink=null;
+    }else{
+        curThink=tObj;
+        setThinkingBtn(true);
+    }
+    rebuildCalls(tObj);
+}
+
 // ── Messages ──
 function renderCL(c,a){const l=$('cl');l.innerHTML='';const entries=Object.entries(c).reverse();for(const[id,nm]of entries){const el=document.createElement('div');el.className='ci'+(id===a?' on':'');el.dataset.c=id;el.innerHTML=`<span class="n">${E(nm)}</span><button class="d" onclick="event.stopPropagation();confirmDel('${id}')">✕</button>`;el.onclick=()=>ws.send(JSON.stringify({action:'switch_conversation',id}));l.appendChild(el)}}
 function clearMs(){$('ms').innerHTML='';curThink=null;for(const k in allThinks)delete allThinks[k]}
 function showEmpty(){$('ms').innerHTML='<div class="es" id="es"><div class="eo"></div><h2>JARVIS</h2><p>Ask anything.</p></div>'}
 function scrollMs(){$('ms').scrollTop=$('ms').scrollHeight}
 
-function aM(role,text){
-  const c=$('ms');const es=c.querySelector('.es');if(es)es.remove();let el;
+function aM(role,text,thinking_trace){
+  const c=$('ms');const es=c.querySelector('.es');if(es)es.remove();
+  if(role==='assistant'&&thinking_trace){
+    thinkId++;
+    const tid=thinkId;
+    let calls=[];
+    try{const parsed=JSON.parse(thinking_trace);if(Array.isArray(parsed)){calls=parsed.map(item=>({name:item.model||'Thinking',label:item.label||'',chunks:item.content?[item.content]:[],status:'done'}));}}catch(e){
+    // Legacy fallback: \x1fCALL\x1f separator (pre-fix format)
+    const SEP='\x1fCALL\x1f';const segments=(thinking_trace.includes(SEP)?thinking_trace.split(SEP):thinking_trace.split('\n\n')).filter(s=>s.trim());
+    calls=segments.map(seg=>{const lines=seg.split('\n');const header=lines[0];const dash=header.indexOf(' — ');const content=lines.slice(1).join('\n');const name=dash>=0?header.substring(0,dash).trim():(header.length>50?'Thinking':header);const label=dash>=0?header.substring(dash+3).trim():'';return{name,label,chunks:content?[content]:[],status:'done'};});}
+    const tEl=document.createElement('div');
+    tEl.className='think-block';tEl.dataset.tid=tid;
+    tEl.innerHTML=`<div class="think-sum" data-tid="${tid}"><div class="think-pulse"></div><span class="think-text">${calls.length} calls</span><span class="think-arrow">▼</span></div><div class="think-calls"></div>`;
+    tEl.querySelector('.think-sum').onclick=()=>toggleExp(tid);
+    c.appendChild(tEl);
+    const tObj={id:tid,el:tEl,calls,expanded:false,openIdx:-1};
+    allThinks[tid]=tObj;
+    rebuildCalls(tObj);
+  }
+  let el;
   if(role==='system'){el=document.createElement('div');el.className='ms-sys';el.textContent=text}
   else if(role==='user'){el=document.createElement('div');el.className='mu';el.innerHTML=`<div class="mu-in">${E(text)}</div>`}
   else{
@@ -452,7 +560,7 @@ function sendOrStop(){
 }
 const MODE_PREFIXES=['!!deepcode ','!!simple ','!!medium ','!!hard ','!!deep ','!!conjecture ','!!compute ','!!prove ','!!image '];
 function stripPrefix(t){const tl=t.toLowerCase();for(const p of MODE_PREFIXES){if(tl.startsWith(p))return t.slice(p.length).trim()}return t}
-function snd(){const i=$('input'),t=(px+i.value).trim();if(!t||!ws||ws.readyState!==1)return;aM('user',stripPrefix(i.value.trim()));ws.send(JSON.stringify({action:'message',text:t}));i.value='';i.style.height='auto';setThinkingBtn(true)}
+function snd(){const i=$('input'),t=(px+i.value).trim();if(!t||!ws||ws.readyState!==1)return;aM('user',stripPrefix(i.value.trim()));processingConvId=activeConvId;ws.send(JSON.stringify({action:'message',text:t}));i.value='';i.style.height='auto';setThinkingBtn(true)}
 function stopThink(){if(ws&&ws.readyState===1)ws.send(JSON.stringify({action:'stop'}));setThinkingBtn(false)}
 function setThinkingBtn(thinking){
   isThinking=thinking;

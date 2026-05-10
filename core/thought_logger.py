@@ -8,7 +8,7 @@ Each model's full reasoning is appended to its own file as chunks arrive,
 and simultaneously echoed to stderr so you can watch models think in real time.
 
 Files are named after the model short-name, e.g.:
-  deepseek-v3.2.md, glm-5.md, minimax-m2.5.md, qwen-3.5.md, nemotron-super.md
+  deepseek-v4-pro.md, glm-5.md, minimax-m2.5.md, qwen-3.5.md, nemotron-super.md
   kimi-k2.md, llama-4-scout.md, ...
 """
 
@@ -43,7 +43,7 @@ _DIM   = "\033[2m"
 
 # Sorted known model names → stable colour index
 _KNOWN_MODELS = [
-    "deepseek-v3.2",
+    "deepseek-v4-pro",
     "gemini",
     "glm-5",
     "gpt-oss-120b",
@@ -92,7 +92,7 @@ def new_session(prompt: str = "") -> Path:
 
 
 def _model_filename(model_id: str) -> str:
-    """Convert 'nvidia/deepseek-v3.2' → 'deepseek-v3.2.md'"""
+    """Convert 'nvidia/deepseek-v4-pro' → 'deepseek-v4-pro.md'"""
     return model_id.split("/")[-1] + ".md"
 
 

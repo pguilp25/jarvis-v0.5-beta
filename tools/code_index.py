@@ -34,7 +34,7 @@ from tools.codebase import scan_project, read_file, IGNORE_DIRS, IGNORE_EXTENSIO
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 INDEX_MODEL = "nvidia/glm-5.1"       # 128K context — process in batches
-INDEX_FALLBACK = "nvidia/deepseek-v3.2"    # Fallback
+INDEX_FALLBACK = "nvidia/deepseek-v4-pro"    # Fallback
 BATCH_TOKEN_LIMIT = 100_000                # Max tokens per batch
 MAPS_DIR_NAME = ".jarvis/maps"
 
@@ -573,6 +573,18 @@ Write the merged GENERAL MAP:""", max_tokens=8192, log_label="merging general ma
 
     # Save to cache
     _save_maps(project_root, file_hash, general, detailed, purpose)
+
+    # Build semantic embeddings index in the background (non-blocking)
+    if purpose:
+        try:
+            import asyncio as _asyncio
+            from tools.embeddings import build_embeddings as _build_embeddings
+            maps_dir = _maps_dir(project_root)
+            _asyncio.ensure_future(_build_embeddings(purpose, maps_dir, file_hash))
+            status("Semantic index: building in background...")
+        except Exception as _e:
+            warn(f"Semantic index build skipped: {_e}")
+
     success(f"Maps generated and cached ({len(chunks)} batch(es))")
 
     return {"general": general, "detailed": detailed, "purpose": purpose}
@@ -763,3 +775,10 @@ def list_purposes(purpose_map: str) -> list[str]:
     """List all category names in the purpose map."""
     import re
     return re.findall(r'===\s*PURPOSE:\s*(.+?)\s*===', purpose_map)
+
+
+def semantic_search(query: str, purpose_map: str, project_root: str, top_n: int = 10) -> str:
+    """Synchronous wrapper — semantic search is handled async via tool_call.py.
+    This fallback is only used when called outside the async context.
+    """
+    return f"(semantic search requires async context — use [SEMANTIC: {query}] in the tool loop)"

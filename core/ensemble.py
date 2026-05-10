@@ -58,7 +58,7 @@ async def _two_step_ensemble(
     # Select models
     if complexity >= 9:
         models = [
-            "nvidia/deepseek-v3.2",
+            "nvidia/deepseek-v4-pro",
             "nvidia/glm-5",
             "nvidia/minimax-m2.5",
             "nvidia/qwen-3.5",
@@ -273,7 +273,7 @@ async def _nvidia_pair(prompt: str, pair: tuple) -> list[dict]:
 async def _nvidia_ensemble_5(prompt: str, ctx_tokens: int) -> list[dict]:
     """Full 5-model ensemble — ALL parallel."""
     all_nvidia = [
-        "nvidia/deepseek-v3.2",
+        "nvidia/deepseek-v4-pro",
         "nvidia/glm-5",
         "nvidia/minimax-m2.5",
         "nvidia/qwen-3.5",

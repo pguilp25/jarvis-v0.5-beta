@@ -284,7 +284,7 @@ async def research_agent(state: AgentState) -> AgentState:
     # ══ RESEARCH PIPELINE ════════════════════════════════════════════════
     # Loop A: Steps 3→4 (briefing convergence, max 2)
     # Loop B: Steps 6→7 (conclusion convergence, max 2)
-    briefing_models = ["groq/llama-4-scout", "nvidia/deepseek-v3.2", "nvidia/qwen-3.5"]
+    briefing_models = ["groq/llama-4-scout", "nvidia/deepseek-v4-pro", "nvidia/qwen-3.5"]
     disagreement_context = ""
 
     # ── LOOP A: Steps 3-4 (briefing convergence) ─────────────────────
@@ -447,7 +447,7 @@ async def research_agent(state: AgentState) -> AgentState:
 
         conclusions = list(await asyncio.gather(
             _conclude_one("groq/llama-4-scout", conclude_prompt),
-            _conclude_one("nvidia/deepseek-v3.2", conclude_prompt),
+            _conclude_one("nvidia/deepseek-v4-pro", conclude_prompt),
             _conclude_one("nvidia/qwen-3.5", conclude_prompt),
         ))
         status(f"Got {len(conclusions)} conclusions")

@@ -29,53 +29,216 @@ DETAIL_TAG = re.compile(r'\[DETAIL:\s*(.+?)\]', re.IGNORECASE)
 CODE_TAG = re.compile(r'\[CODE:\s*(.+?)\]', re.IGNORECASE)
 REFS_TAG = re.compile(r'\[REFS:\s*(.+?)\]', re.IGNORECASE)
 PURPOSE_TAG = re.compile(r'\[PURPOSE:\s*(.+?)\]', re.IGNORECASE)
+SEMANTIC_TAG = re.compile(r'\[SEMANTIC:\s*(.+?)\]', re.IGNORECASE)
 LSP_TAG = re.compile(r'\[LSP:\s*(.+?)\]', re.IGNORECASE)
 KNOWLEDGE_TAG = re.compile(r'\[KNOWLEDGE:\s*(.+?)\]', re.IGNORECASE)
 # KEEP strips a previously-loaded [CODE:] result to only the specified line
 # ranges, removing the full file from context.  Format:
 #   [KEEP: filepath 10-50, 80-120]
 KEEP_TAG = re.compile(r'\[KEEP:\s*(.+?)\]', re.IGNORECASE)
-# DONE signals the model is finished — no more tool processing.
+# STOP signals "execute my tool calls now, then let me continue thinking."
+# The model writes tool tags, then [STOP]. We process tools and feed back.
+STOP_TAG = re.compile(r'\[STOP\]', re.IGNORECASE)
+# DONE signals the model is completely finished — apply edits and exit.
+# Only used by coders/reviewers/self-checkers who write edit blocks.
 DONE_TAG = re.compile(r'\[DONE\]', re.IGNORECASE)
+# DISCARD removes a previously-loaded tool result by its #label.
+# Format: [DISCARD: #label]
+DISCARD_TAG = re.compile(r'\[DISCARD:\s*#(\w+)\]', re.IGNORECASE)
+# Label suffix on tool calls — optional #label at the end of the argument.
+# E.g. [REFS: process_turn #ref1] — the #ref1 is the label.
+_LABEL_SUFFIX = re.compile(r'\s+#(\w+)\s*$')
+
+
+def _strip_label(tag_arg: str) -> tuple[str, str | None]:
+    """Strip optional #label from a tool argument. Returns (clean_arg, label_or_None)."""
+    m = _LABEL_SUFFIX.search(tag_arg)
+    if m:
+        return tag_arg[:m.start()].strip(), m.group(1)
+    return tag_arg.strip(), None
+
+
+# ─── Quote / Edit-block masking ─────────────────────────────────────────────
+# Models often DISCUSS tool tags in prose ("I'll then [KEEP: file 50-80]")
+# or copy them inside fenced code blocks while explaining a plan. The naive
+# regex extractors used to fire on those, sending the model into a loop where
+# every round it explained that it was about to call a tool, and the system
+# went and called it again. The model never gets a chance to think.
+#
+# We mask out tool-tag-shaped substrings that appear inside:
+#   1. Backtick-quoted spans (`...` and ```...```)
+#   2. `=== EDIT: ... === ... [/REPLACE]` (or [/INSERT]) blocks — tags inside
+#      an open edit block are file CONTENT being inserted, not tool calls.
+#   3. Lines explicitly marked with the literal escape "\["  (model
+#      convention: write `\[KEEP: ...]` to mention without invoking).
+#
+# Mask = replace every '[' with '\x00' so tag regexes don't match.  We never
+# show the masked text to anyone — just feed it through extractors.
+
+_FENCED_CODE_BLOCK = re.compile(r'```.*?```', re.DOTALL)
+_INLINE_BACKTICK = re.compile(r'`[^`\n]+`')
+_THINK_BLOCK = re.compile(r'<think>.*?</think>', re.DOTALL | re.IGNORECASE)
+# Deliberate tool-use blocks: [tool use]...[/tool use]
+# When ANY such block is present in the response, ONLY tags inside these
+# blocks are executed — everything outside is treated as explanatory text.
+# This prevents accidental/hallucinated tool calls.
+_TOOL_USE_BLOCK = re.compile(r'\[tool use\](.*?)\[/tool use\]', re.DOTALL | re.IGNORECASE)
+# Edit/code-writing blocks — content inside is CODE, not tool calls.
+# Each pattern covers one form of code writing the coder can produce.
+# All are masked so tool tags inside written code never fire accidentally.
+
+# === EDIT: ... === end FILE === (full file creation)
+_EDIT_FILE_SPAN = re.compile(
+    r'===\s*FILE:.*?===\s*END\s+FILE\s*===',
+    re.DOTALL | re.IGNORECASE,
+)
+# [SEARCH]...[/SEARCH] — code the coder is searching for
+_SEARCH_BLOCK = re.compile(r'\[SEARCH[^\]]*\](.*?)\[/SEARCH\]', re.DOTALL | re.IGNORECASE)
+# [REPLACE]...[/REPLACE] — replacement code
+_REPLACE_BLOCK = re.compile(r'\[REPLACE[^\]]*\](.*?)\[/REPLACE\]', re.DOTALL | re.IGNORECASE)
+# [INSERT AFTER LINE N]...[/INSERT] — inserted code
+_INSERT_BLOCK = re.compile(r'\[INSERT[^\]]*\](.*?)\[/INSERT\]', re.DOTALL | re.IGNORECASE)
+# Legacy: === EDIT: ... [/REPLACE] span (catches multi-block edits partially)
+_EDIT_BLOCK_SPAN = re.compile(
+    r'===\s*(?:EDIT|FILE):.*?'
+    r'(?:'
+        r'\[/REPLACE\]|\[/INSERT\]|===\s*END\s+FILE\s*==='
+    r')',
+    re.DOTALL | re.IGNORECASE,
+)
+_BACKSLASH_BRACKET = re.compile(r'\\\[')
+
+
+def _mask_quoted_tags(text: str) -> str:
+    """Return text with `[` replaced by NUL inside any region where tags
+    should NOT be interpreted as tool calls.
+
+    The result is ONLY used to drive tag extraction. The model's actual
+    response is unchanged. NUL is a safe sentinel — it never appears in
+    legitimate model output and prevents any `\\[(SEARCH|...)` regex from
+    matching across the masked spans.
+    """
+    if not text or '[' not in text:
+        return text
+
+    masked = list(text)
+
+    def _blank(start: int, end: int) -> None:
+        for i in range(start, min(end, len(masked))):
+            if masked[i] == '[':
+                masked[i] = '\x00'
+
+    # 0. <think>...</think> blocks — model's internal reasoning.
+    # Tags written inside thinking are NOT intended as tool calls.
+    for m in _THINK_BLOCK.finditer(text):
+        _blank(m.start(), m.end())
+
+    # 1. Fenced code blocks (```...```)
+    for m in _FENCED_CODE_BLOCK.finditer(text):
+        _blank(m.start(), m.end())
+
+    # 2. Inline backtick spans (`...`)
+    for m in _INLINE_BACKTICK.finditer(text):
+        _blank(m.start(), m.end())
+
+    # 3. Code-writing blocks — mask all forms where the model writes actual code.
+    # Tool tags inside written code must NEVER fire as real tool calls.
+    for pattern in (_EDIT_FILE_SPAN, _SEARCH_BLOCK, _REPLACE_BLOCK,
+                    _INSERT_BLOCK, _EDIT_BLOCK_SPAN):
+        for m in pattern.finditer(text):
+            _blank(m.start(), m.end())
+
+    # 3b. Legacy edit block span (belt-and-suspenders for === EDIT: blocks)
+    for m in _EDIT_BLOCK_SPAN.finditer(text):
+        _blank(m.start(), m.end())
+
+    # 4. Explicit escape: `\[TAG: ...]` → mask just the leading `[`
+    for m in _BACKSLASH_BRACKET.finditer(text):
+        # The `[` is at m.end() - 1
+        idx = m.end() - 1
+        if 0 <= idx < len(masked) and masked[idx] == '[':
+            masked[idx] = '\x00'
+
+    # 5. [tool use]...[/tool use] enforcement:
+    # If the response contains ANY deliberate tool-use blocks, mask every `[`
+    # that is OUTSIDE those blocks. This ensures accidental tag mentions in
+    # explanatory text, examples, or mid-thought analysis never fire as real
+    # tool calls — only explicitly wrapped calls execute.
+    # If no [tool use] blocks are present, fall through unchanged (backward compat).
+    tool_use_blocks = list(_TOOL_USE_BLOCK.finditer(text))
+    if tool_use_blocks:
+        # Build the set of character positions that are INSIDE a block's content
+        inside = set()
+        for m in tool_use_blocks:
+            inside.update(range(m.start(1), m.end(1)))
+        # Mask every [ that is outside all blocks (skipping already-NUL positions)
+        for i in range(len(masked)):
+            if masked[i] == '[' and i not in inside:
+                masked[i] = '\x00'
+
+    return ''.join(masked)
 
 
 def extract_search_tags(text: str) -> list[str]:
-    # Exclude pure line-range patterns like "339-342" or "25-28" — these are
-    # [SEARCH: N-M] anchored edit syntax, not code search queries.  Routing
-    # them to ripgrep produces garbage results and causes the model to loop.
+    # Exclude patterns that are edit syntax, not code search queries:
+    # 1. Pure line-range patterns like "339-342" — [SEARCH: N-M] anchored edit
+    # 2. File paths like "ui/index.html" — [SEARCH: filepath] edit reference
+    # Routing these to ripgrep produces garbage results and causes the model to loop.
     _LINE_RANGE = re.compile(r'^\d+\s*-\s*\d+$')
-    return [q for q in SEARCH_TAG.findall(text) if not _LINE_RANGE.match(q.strip())]
+    # File-path heuristic: contains a dot-extension (2-5 chars) and optionally
+    # path separators. Real search queries are identifiers/patterns, not paths.
+    _FILE_PATH = re.compile(r'\.\w{1,5}$')
+    masked = _mask_quoted_tags(text)
+    results = []
+    for q in SEARCH_TAG.findall(masked):
+        clean, _ = _strip_label(q)
+        stripped = clean.strip()
+        if _LINE_RANGE.match(stripped):
+            continue  # anchored edit syntax [SEARCH: 45-49]
+        if _FILE_PATH.search(stripped) and not ' ' in stripped:
+            continue  # file path like "ui/index.html", not a search query
+        results.append(q)
+    return results
 
 def extract_websearch_tags(text: str) -> list[str]:
-    return WEBSEARCH_TAG.findall(text)
+    return WEBSEARCH_TAG.findall(_mask_quoted_tags(text))
 
 def extract_detail_tags(text: str) -> list[str]:
-    return DETAIL_TAG.findall(text)
+    return DETAIL_TAG.findall(_mask_quoted_tags(text))
 
 def extract_code_tags(text: str) -> list[str]:
-    return CODE_TAG.findall(text)
+    return CODE_TAG.findall(_mask_quoted_tags(text))
 
 def extract_refs_tags(text: str) -> list[str]:
-    return REFS_TAG.findall(text)
+    return REFS_TAG.findall(_mask_quoted_tags(text))
 
 def extract_purpose_tags(text: str) -> list[str]:
-    return PURPOSE_TAG.findall(text)
+    return PURPOSE_TAG.findall(_mask_quoted_tags(text))
+
+def extract_semantic_tags(text: str) -> list[str]:
+    return SEMANTIC_TAG.findall(_mask_quoted_tags(text))
 
 def extract_lsp_tags(text: str) -> list[str]:
-    return LSP_TAG.findall(text)
+    return LSP_TAG.findall(_mask_quoted_tags(text))
 
 def extract_knowledge_tags(text: str) -> list[str]:
-    return KNOWLEDGE_TAG.findall(text)
+    return KNOWLEDGE_TAG.findall(_mask_quoted_tags(text))
 
 def extract_keep_tags(text: str) -> list[str]:
-    return KEEP_TAG.findall(text)
+    return KEEP_TAG.findall(_mask_quoted_tags(text))
+
+def extract_discard_tags(text: str) -> list[str]:
+    """Extract #labels from [DISCARD: #label] tags."""
+    return DISCARD_TAG.findall(_mask_quoted_tags(text))
 
 def has_tool_tags(text: str) -> bool:
-    return bool(SEARCH_TAG.search(text) or WEBSEARCH_TAG.search(text)
-                or DETAIL_TAG.search(text) or CODE_TAG.search(text)
-                or REFS_TAG.search(text) or PURPOSE_TAG.search(text)
-                or LSP_TAG.search(text) or KNOWLEDGE_TAG.search(text)
-                or KEEP_TAG.search(text))
+    masked = _mask_quoted_tags(text)
+    return bool(SEARCH_TAG.search(masked) or WEBSEARCH_TAG.search(masked)
+                or DETAIL_TAG.search(masked) or CODE_TAG.search(masked)
+                or REFS_TAG.search(masked) or PURPOSE_TAG.search(masked)
+                or SEMANTIC_TAG.search(masked)
+                or LSP_TAG.search(masked) or KNOWLEDGE_TAG.search(masked)
+                or KEEP_TAG.search(masked) or DISCARD_TAG.search(masked))
 
 
 # ─── Tool Runners ────────────────────────────────────────────────────────────
@@ -140,11 +303,50 @@ def _run_detail_lookups(section_names: list[str], detailed_map: str) -> str:
 
 # ─── Code File Reader ───────────────────────────────────────────────────────
 
-def _run_code_reads(filepaths: list[str], project_root: str) -> str:
+def _parse_code_arg(raw: str) -> tuple[str, list[tuple[int, int]] | None]:
+    """Parse a [CODE: ...] argument into (filepath, optional_line_ranges).
+
+    Handles:
+      [CODE: ui/server.py]           → ("ui/server.py", None)
+      [CODE: ui/server.py 87-95]     → ("ui/server.py", [(87, 95)])
+      [CODE: ui/server.py 87-95, 200-250]  → ("ui/server.py", [(87, 95), (200, 250)])
+      [CODE: main.py 390-505]        → ("main.py", [(390, 505)])
+    """
+    raw = raw.strip()
+    # Match a trailing sequence of "N-M" ranges (optionally comma-separated)
+    # after the filepath.  The filepath itself never contains digits-dash-digits
+    # as a trailing token.
+    range_pat = re.compile(r'\s+((?:\d+\s*-\s*\d+)(?:\s*,\s*\d+\s*-\s*\d+)*)\s*$')
+    m = range_pat.search(raw)
+    if not m:
+        return raw, None
+    filepath = raw[:m.start()].strip()
+    ranges = []
+    for rng in re.findall(r'(\d+)\s*-\s*(\d+)', m.group(1)):
+        ranges.append((int(rng[0]), int(rng[1])))
+    return filepath, ranges if ranges else None
+
+
+def _run_code_reads(
+    filepaths: list[str], project_root: str,
+    viewed_versions: "dict[str, str] | None" = None,
+) -> str:
     """Read source code files from the sandbox.
 
     Always reads from .jarvis_sandbox/ — that's the working copy where
     all edits are applied. The real project is untouched.
+
+    Supports optional line-range arguments:
+      [CODE: path N-M]        → return only lines N through M
+      [CODE: path N-M, A-B]   → return multiple ranges
+
+    If `viewed_versions` is provided, the content of every successfully-read
+    file is recorded there (keyed by filepath). This is what the model just
+    saw, so any [REPLACE LINES X-Y] edits the model writes after this read
+    have line numbers relative to THIS content. The on_stop callback uses
+    that snapshot as the basis for line edits, instead of whatever the
+    file looks like at apply time (which may have changed via earlier
+    mid-stream edits in the same response).
     """
     import os
     from tools.codebase import read_file, norm_path, add_line_numbers
@@ -153,13 +355,19 @@ def _run_code_reads(filepaths: list[str], project_root: str) -> str:
     sandbox_dir = os.path.join(project_root, ".jarvis_sandbox")
 
     output_parts = []
-    for fpath in filepaths:
+    for raw_fpath in filepaths:
+        # Parse optional line ranges from the argument
+        fpath, line_ranges = _parse_code_arg(raw_fpath)
         fpath = norm_path(fpath.strip())
-        status(f"    Reading code: {fpath}")
+        if line_ranges:
+            range_str = ", ".join(f"{a}-{b}" for a, b in line_ranges)
+            status(f"    Reading code: {fpath} (lines {range_str})")
+        else:
+            status(f"    Reading code: {fpath}")
 
         content = None
 
-        # Always read from sandbox
+        # Always read from sandbox first
         sandbox_path = os.path.join(sandbox_dir, fpath)
         if os.path.isfile(sandbox_path):
             try:
@@ -168,25 +376,63 @@ def _run_code_reads(filepaths: list[str], project_root: str) -> str:
             except Exception:
                 content = None
 
-        # Fallback: sandbox might not have this file (not in project)
+        # Fallback: project root, then CWD
         if content is None:
             full_path = os.path.join(project_root, fpath)
             content = read_file(full_path)
         if not content or content.startswith("["):
             content = read_file(fpath)
 
-        if content and not content.startswith("["):
-            numbered = add_line_numbers(content)
-            line_count = content.count('\n') + 1
-            output_parts.append(f"\n=== Code: {fpath} ({line_count} lines) ===\n{numbered}")
+        # Binary / unreadable files return a [... — skipped] string — treat as missing
+        if content and content.startswith("[BINARY") or (content and content.startswith("[READ ERROR")):
+            output_parts.append(f"\n=== Code: {fpath} — {content.strip()} ===")
+            continue
 
-            if line_count > KEEP_HINT_THRESHOLD:
+        if content is not None and not content.startswith("["):
+            # Record the FULL file version the model is about to see — line
+            # numbers in any subsequent [REPLACE LINES] are relative to this.
+            if viewed_versions is not None:
+                viewed_versions[fpath] = content
+
+            all_lines = content.split('\n')
+            total_lines = len(all_lines)
+
+            if line_ranges:
+                # Return only the requested line ranges with correct numbering.
+                # Format matches add_line_numbers: `iN|{code} {lineno}` (single
+                # space). Stays consistent with KEEP output so the model sees
+                # ONE format end-to-end.
+                selected_parts = []
+                for start, end in line_ranges:
+                    start = max(1, start)
+                    end = min(total_lines, end)
+                    slice_lines = all_lines[start - 1:end]
+                    renumbered = []
+                    for i, line in enumerate(slice_lines):
+                        expanded = line.expandtabs(4)
+                        stripped = expanded.lstrip(' ')
+                        n_indent = len(expanded) - len(stripped)
+                        renumbered.append(f"i{n_indent}|{stripped} {start + i}")
+                    selected_parts.append('\n'.join(renumbered))
+
+                range_str = ", ".join(f"{a}-{b}" for a, b in line_ranges)
+                combined = '\n'.join(selected_parts)
                 output_parts.append(
-                    f"\n⚠ {fpath} is large ({line_count} lines). "
-                    f"Use [KEEP: {fpath} X-Y, A-B] to select only the line "
-                    f"ranges you need — the full file will be replaced with just "
-                    f"those ranges, freeing context for your actual work.\n"
-                    f"Example: [KEEP: {fpath} 1-15, 200-250, 310-340]"
+                    f"\n=== Code: {fpath} (lines {range_str} of {total_lines}) ===\n{combined}"
+                )
+            else:
+                numbered = add_line_numbers(content)
+                large_note = ""
+                if total_lines > KEEP_HINT_THRESHOLD:
+                    large_note = (
+                        f"⚠ Big file ({total_lines} lines) — "
+                        f"[KEEP: {fpath} X-Y, A-B] recommended to select only "
+                        f"the lines you need.\n"
+                    )
+                output_parts.append(
+                    f"\n=== Code: {fpath} ({total_lines} lines) ===\n"
+                    f"{large_note}"
+                    f"{numbered}"
                 )
         else:
             output_parts.append(f"\n=== Code: {fpath} — FILE NOT FOUND ===")
@@ -199,6 +445,7 @@ async def _run_keep(
     keep_args: list[str], project_root: str,
     persistent_lookups: dict[str, str],
     research_cache: dict | None = None,
+    viewed_versions: "dict[str, str] | None" = None,
 ) -> str:
     """Process [KEEP: filepath X-Y, A-B] tags.
 
@@ -266,6 +513,13 @@ async def _run_keep(
         if not raw_content or raw_content.startswith("["):
             output_parts.append(f"=== KEEP: file not found '{filepath}' ===")
             continue
+
+        # Record what the model is about to see — KEEP preserves real line
+        # numbers, so any subsequent [REPLACE LINES X-Y] anchors to THIS
+        # snapshot (not whatever the file looks like at apply time after
+        # mid-stream edits).
+        if viewed_versions is not None:
+            viewed_versions[filepath] = raw_content
 
         # Parse KEEP ranges
         ranges = _parse_keep_ranges(ranges_text, filepath)
@@ -369,7 +623,8 @@ def _run_knowledge_lookups(topics: list[str]) -> str:
 # ─── Tool Tag Detection (for stream early-stop) ─────────────────────────────
 
 _ALL_TAGS = re.compile(
-    r'\[(SEARCH|WEBSEARCH|DETAIL|CODE|REFS|PURPOSE|LSP|KNOWLEDGE|KEEP):\s*.+?\]',
+    r'\[(SEARCH|WEBSEARCH|DETAIL|CODE|REFS|PURPOSE|LSP|KNOWLEDGE|KEEP|DISCARD):\s*.+?\]'
+    r'|\[STOP\]',
     re.IGNORECASE,
 )
 
@@ -392,6 +647,76 @@ def _strip_after_last_tag(text: str) -> str:
     return text[:last_match.end()]
 
 
+_TOOL_USE_OPEN  = re.compile(r'\[tool use\]',  re.IGNORECASE)
+_TOOL_USE_CLOSE = re.compile(r'\[/tool use\]', re.IGNORECASE)
+
+
+def _autocomplete_tool_blocks(text: str) -> tuple[str, int]:
+    """Close any unclosed [tool use] blocks by appending [/tool use] after
+    the last tool tag or [STOP] in each block.
+
+    Returns (fixed_text, number_of_blocks_fixed).
+    A non-zero count means the model wrote [tool use] but forgot [/tool use].
+    """
+    opens  = list(_TOOL_USE_OPEN.finditer(text))
+    closes = list(_TOOL_USE_CLOSE.finditer(text))
+    unclosed = len(opens) - len(closes)
+    if unclosed <= 0:
+        return text, 0
+
+    # Find the rightmost complete tool tag or [STOP] to insert after.
+    all_markers = list(_ALL_TAGS.finditer(text))
+    stop_markers = list(STOP_TAG.finditer(text))
+    all_end_positions = [m.end() for m in all_markers + stop_markers]
+    insert_pos = max(all_end_positions) if all_end_positions else len(text)
+
+    closing = (' [/tool use]' * unclosed)
+    fixed = text[:insert_pos] + closing + text[insert_pos:]
+    return fixed, unclosed
+
+
+def _describe_tool_mode(result: str) -> str:
+    """Return a short string describing whether block or fallback mode is active."""
+    blocks = list(_TOOL_USE_BLOCK.finditer(result))
+    if blocks:
+        return f"block mode ({len(blocks)} [tool use] block(s))"
+    return "bare-tag fallback (model omitted [tool use] wrapper)"
+
+
+def _tag_summary(
+    code_tags, web_tags, detail_tags, file_tags, refs_tags,
+    purpose_tags, semantic_tags, lsp_tags, knowledge_tags, keep_tags,
+    research_cache: dict | None,
+    persistent_lookups: dict,
+) -> str:
+    """Build a one-line summary of tags found this round with cache annotations."""
+    parts = []
+    def _note(label: str, tags: list[str], type_key: str) -> None:
+        if not tags:
+            return
+        hits = 0
+        if research_cache is not None and type_key not in ("CODE", "KEEP"):
+            for t in tags:
+                clean, _ = _strip_label(t)
+                k = f"{type_key}:{clean.strip().lower()}"
+                if k in research_cache or k in persistent_lookups:
+                    hits += 1
+        hit_str = f" ({hits} cached)" if hits else ""
+        parts.append(f"{label}×{len(tags)}{hit_str}")
+
+    _note("CODE",     file_tags,     "CODE")
+    _note("REFS",     refs_tags,     "REFS")
+    _note("SEARCH",   code_tags,     "SEARCH")
+    _note("WEB",      web_tags,      "WEBSEARCH")
+    _note("DETAIL",   detail_tags,   "DETAIL")
+    _note("PURPOSE",  purpose_tags,  "PURPOSE")
+    _note("SEMANTIC", semantic_tags, "SEMANTIC")
+    _note("LSP",      lsp_tags,      "LSP")
+    _note("KNOW",     knowledge_tags,"KNOWLEDGE")
+    _note("KEEP",     keep_tags,     "KEEP")
+    return ", ".join(parts) if parts else "(none)"
+
+
 # ─── Main Tool Call Loop ────────────────────────────────────────────────────
 
 async def call_with_tools(
@@ -399,19 +724,40 @@ async def call_with_tools(
     prompt: str,
     project_root: str | None = None,
     max_tokens: int = 16384,
-    max_rounds: int = 30,
+    max_rounds: int = 20,
     enable_code_search: bool = True,
     enable_web_search: bool = True,
     detailed_map: str | None = None,
     purpose_map: str | None = None,
     research_cache: dict | None = None,
     log_label: str = "",
+    on_stop: "Callable[[str], None] | None" = None,
+    viewed_versions: "dict[str, str] | None" = None,
+    stop_on_tool_block: bool = False,
 ) -> dict:
     """
     Call a model with mid-thought tool use.
 
-    The AI thinks, writes tool tags (e.g. [CODE: ...], [REFS: ...]).
+    The AI wraps tool calls in [tool use]...[/tool use] then [STOP].
+    Only tags INSIDE [tool use] blocks execute — tags outside are ignored.
     JARVIS runs ALL requested lookups at once and feeds results back.
+
+    Signals:
+      [STOP]   → execute tool calls + on_stop callback, continue thinking
+      [DONE]   → apply final edits, model is completely finished
+
+    on_stop: optional callback called with full_response when [STOP] fires.
+             Used by coders to apply pending edit blocks before tool lookups,
+             so [CODE:] reads return the post-edit state.
+
+    viewed_versions: optional dict updated whenever the model reads a file via
+             [CODE: path]. Maps filepath → content the model just saw. Used by
+             on_stop to anchor [REPLACE LINES] edits to the version the model
+             was actually looking at, instead of whatever the file currently
+             is on disk. Without this, a model that views V0, writes [REPLACE
+             LINES 22-24], then writes more edits after a mid-stream [STOP]
+             would have its V0-relative line numbers applied to the post-STOP
+             file (which has different line numbers).
 
     Tool tags:
       [SEARCH: pattern]       → code search
@@ -419,14 +765,19 @@ async def call_with_tools(
       [DETAIL: section name]  → detailed code map lookup
       [CODE: path/to/file]    → read actual source code file
       [REFS: name]            → find all definitions, imports, usages
-      [PURPOSE: category]     → all code serving a purpose
+      [PURPOSE: category]     → all code serving a purpose (exact/fuzzy category name)
+      [SEMANTIC: description] → vector embedding search over purpose categories, returns top 10 matches
+      [DISCARD: #label]       → remove a labeled result from context
 
     research_cache: shared dict that accumulates all lookup results across
     multiple AI calls. Same tag won't re-run if cached.
 
-    Returns {"model": str, "answer": str, "research": {tag_key: result}}.
+    Returns {"model": str, "answer": str, "done": bool, "research": {tag_key: result}}.
+    "done" is True when the model explicitly wrote [DONE] — it is NOT present in
+    "answer" (stripped before return), so callers must check this flag, not the text.
     """
     full_response = ""
+    _done_signaled = False
     current_prompt = prompt
     # Track this call's research (also writes to shared cache if provided)
     local_research: dict[str, str] = {}
@@ -434,65 +785,99 @@ async def call_with_tools(
     # When [KEEP:] fires, it REPLACES the corresponding [CODE:] entry, removing
     # the full file from context and inserting only the kept ranges.
     persistent_lookups: dict[str, str] = {}
+    # Maps #label → list of TYPE:arg keys, for [DISCARD: #label] support.
+    _label_to_keys: dict[str, list[str]] = {}
+    # Stall guard: if the model issues only ALREADY-CACHED tools for two
+    # rounds in a row, it's spinning — break and let it commit. Tracks the
+    # set of tag-keys requested per round.
+    _last_round_keys: set[str] = set()
+    _stall_rounds: int = 0
+
+    # ── Context manifest — tracks what this model has actually received ──────
+    # {key: {"round": int, "tag_type": str, "arg": str}}
+    # Only contains tools this model ran or whose shared-cache results it got.
+    _manifest: dict[str, dict] = {}
+
+    # Per-round response text — used to build tagged round history in prompt.
+    _round_texts: list[str] = []  # _round_texts[i] = text produced in round i+1
 
     def _stop_check(accumulated: str) -> bool:
-        # Check for [DONE] — model is finished, stop immediately
+        # [STOP] and [DONE] are written OUTSIDE [tool use] blocks.
+        # Check them against raw unmasked text — block enforcement masking
+        # converts their '[' to \x00, which makes STOP_TAG.search(masked) fail.
         if DONE_TAG.search(accumulated):
             return True
+        if STOP_TAG.search(accumulated):
+            return True
 
-        # Check for STOP keyword after a tag (legacy, some models still write it)
-        if _text_has_complete_tag(accumulated):
-            last_tag = list(_ALL_TAGS.finditer(accumulated))
-            if last_tag:
-                after = accumulated[last_tag[-1].end():]
-                if re.search(r'\bSTOP\b', after, re.IGNORECASE):
-                    return True
-
-        # Check if response ends with a complete tool tag + minimal trailing text.
-        # This catches models that write "[CODE: file.py]\n" without STOP.
-        stripped = accumulated.rstrip()
-        if stripped.endswith(']') and _text_has_complete_tag(stripped):
-            last_tag = list(_ALL_TAGS.finditer(stripped))
-            if last_tag:
-                tag = last_tag[-1]
-                tag_text = stripped[tag.start():tag.end()]
-                after_tag = stripped[tag.end():].strip()
-                if not after_tag:
-                    # Edit-syntax exception 1: [SEARCH: N-M] is an edit anchor,
-                    # not a tool call. The post-stream parser already handles this
-                    # via `has_misused_search`, but if we stop here the model never
-                    # gets to write the [/SEARCH] [REPLACE] [/REPLACE] that follows.
-                    if re.match(r'\[SEARCH:\s*\d+\s*-\s*\d+\s*\]\Z',
-                                tag_text, re.IGNORECASE):
-                        return False
-                    # Edit-syntax exception 2: ANY tag that appears inside an
-                    # open === EDIT: === block is edit content (the model may
-                    # be editing a file that literally contains [CODE:] etc.).
-                    # An edit block is "open" when the most recent === EDIT: marker
-                    # is more recent than the most recent [/REPLACE] closer.
-                    last_edit_open = stripped.rfind('=== EDIT:')
-                    last_replace_close = stripped.rfind('[/REPLACE]')
-                    if last_edit_open != -1 and last_edit_open > last_replace_close:
-                        return False
-                    return True
+        # For planners/merger only: fire when a COMPLETE [tool use]...[/tool use]
+        # block is present. Coders/reviewers/self-checkers must use [STOP] or
+        # [DONE] — they write tool blocks mid-response (to read a file) and then
+        # continue writing edits, so stopping on the block alone would cut them off.
+        if stop_on_tool_block:
+            masked = _mask_quoted_tags(accumulated)
+            if _TOOL_USE_BLOCK.search(masked):
+                return True
 
         return False
 
+    _empty_streak = 0
     for round_num in range(1, max_rounds + 1):
         result = await call_with_retry(
             model, current_prompt, max_tokens=max_tokens,
             stop_check=_stop_check,
-            log_label=log_label,
+            log_label=f"{log_label} — R{round_num}" if log_label else f"R{round_num}",
         )
 
-        # ── Check for [DONE] — model signals it's finished ───────────
-        # If [DONE] appears anywhere, the model is done. Any tag-like text
-        # in the response (e.g. plan mentioning "[CODE: path]") is content,
-        # not a tool request. Strip [DONE] and break.
+        # ── Empty-response guard ─────────────────────────────────────
+        # Some models return an empty string under load (no reasoning, no
+        # visible content). Without this, the loop kept calling the same
+        # model 30 times for nothing — every call writes a header to the
+        # log and burns rate-limit. Two empty responses in a row → break.
+        if not result or not result.strip():
+            _empty_streak += 1
+            if _empty_streak >= 2:
+                warn(f"  [{model.split('/')[-1]}] round {round_num}: empty response "
+                     f"× {_empty_streak} — breaking tool loop")
+                break
+            warn(f"  [{model.split('/')[-1]}] round {round_num}: empty response "
+                 f"(streak {_empty_streak}) — nudging model")
+            current_prompt = (
+                current_prompt
+                + "\n\nNote: your previous response was empty. "
+                  "Please write your answer now."
+            )
+            continue
+        _empty_streak = 0
+
+        # ── Check for [DONE] — model signals it's completely finished ──
+        # If [DONE] appears, the model is done. Strip [DONE] and break.
         if DONE_TAG.search(result):
             result = DONE_TAG.sub('', result).rstrip()
+            # Also strip [STOP] if present in same response
+            result = STOP_TAG.sub('', result).rstrip()
+            _round_texts.append(result)
             full_response += result
+            _done_signaled = True
             break
+
+        # ── Strip [STOP] tag from response (it's a signal, not content) ──
+        has_stop = bool(STOP_TAG.search(result))
+        result = STOP_TAG.sub('', result)
+        _round_texts.append(result)
+
+        # ── Auto-complete unclosed [tool use] blocks ──────────────────
+        # Models like minimax write [tool use] [CODE:...] but forget [/tool use].
+        # Without the closing tag, _mask_quoted_tags never activates block
+        # enforcement, so tags in explanatory text can fire accidentally.
+        # We close them here before extraction so the masker works correctly.
+        result, n_autoclosed = _autocomplete_tool_blocks(result)
+        if n_autoclosed:
+            warn(
+                f"  [{model.split('/')[-1]}] round {round_num}: "
+                f"auto-closed {n_autoclosed} unclosed [tool use] block(s) "
+                f"— model forgot [/tool use]"
+            )
 
         # ── Detect tool tags anywhere in the response ────────────────
         # If the model wrote [CODE: ...] or [REFS: ...] anywhere in its
@@ -503,13 +888,15 @@ async def call_with_tools(
         file_tags = list(dict.fromkeys(extract_code_tags(result))) if project_root else []
         refs_tags = list(dict.fromkeys(extract_refs_tags(result))) if project_root else []
         purpose_tags = list(dict.fromkeys(extract_purpose_tags(result))) if purpose_map else []
+        semantic_tags = list(dict.fromkeys(extract_semantic_tags(result))) if purpose_map else []
         lsp_tags = list(dict.fromkeys(extract_lsp_tags(result))) if project_root else []
         knowledge_tags = list(dict.fromkeys(extract_knowledge_tags(result)))
         keep_tags = list(dict.fromkeys(extract_keep_tags(result))) if project_root else []
+        discard_tags = extract_discard_tags(result)
 
         has_tags = bool(code_tags or web_tags or detail_tags or file_tags
-                        or refs_tags or purpose_tags or lsp_tags
-                        or knowledge_tags or keep_tags)
+                        or refs_tags or purpose_tags or semantic_tags or lsp_tags
+                        or knowledge_tags or keep_tags or discard_tags)
 
         # Detect the specific mistake: model wrote [SEARCH: N-M] expecting a
         # tool result, but that's edit syntax not a tool.  The filter removed
@@ -557,64 +944,184 @@ async def call_with_tools(
         if not has_tags:
             break  # No tool requests — done
 
+        # ── Apply pending edits BEFORE tool lookups ──────────────────
+        # When a coder writes edit blocks then [STOP] + [CODE: file],
+        # they want to verify their edits. on_stop applies the edits
+        # to the sandbox so [CODE:] reads return the post-edit state.
+        if on_stop is not None:
+            try:
+                on_stop(full_response)
+            except Exception as e:
+                warn(f"  on_stop callback error: {e}")
+
         # Run requested lookups — check cache first
         round_output = ""  # results from THIS round only (for logging)
 
-        # Filter out tags that are already in the cache
+        # Filter out tags this model already ran in a previous round.
+        # NOTE: we only check local_research (this model's own history), NOT
+        # the shared research_cache. Results from other parallel models are NOT
+        # "cached" from this model's perspective — it must request them itself.
+        # This prevents false stall detection and stops the model from thinking
+        # it has seen content it never actually requested.
         def _cached_or_run(tag_type: str, tags: list[str]) -> tuple[list[str], str]:
-            """Returns (uncached_tags, cached_output).
-            CODE and KEEP always re-run — files may have changed between rounds."""
-            # CODE and KEEP always re-run (file content may have changed)
+            """Returns (new_tags_to_run, cached_output_for_already_run_tags).
+            CODE and KEEP always re-run — file content may have changed."""
             if tag_type in ("CODE", "KEEP"):
-                return tags, ""
-            if research_cache is None:
                 return tags, ""
             cached_out = ""
             new_tags = []
             for tag in tags:
-                key = f"{tag_type}:{tag.strip().lower()}"
-                if key in research_cache:
-                    cached_out += research_cache[key]
-                    # Also populate persistent_lookups so the cached result
-                    # ends up in search_output and actually reaches the model.
-                    # Without this, cached REFS/LSP/etc. results silently
-                    # disappear and the model loops asking for the same tool.
-                    persistent_lookups[key] = research_cache[key]
+                clean_tag, label = _strip_label(tag)
+                key = f"{tag_type}:{clean_tag.strip().lower()}"
+                if key in local_research:
+                    # This model ran it in an earlier round — show cached result
+                    rn = _manifest[key]["round"] if key in _manifest else "?"
+                    cached_out += (
+                        f"\n[CACHED — you already ran {tag_type}: {clean_tag} "
+                        f"in round {rn}. Result is unchanged — do not re-request.]\n"
+                        + local_research[key]
+                    )
+                    persistent_lookups[key] = local_research[key]
+                    if label:
+                        _label_to_keys.setdefault(label, []).append(key)
                 else:
                     new_tags.append(tag)
             return new_tags, cached_out
 
         def _store(tag_type: str, tag: str, result: str):
-            """Store a result in the shared cache, local research, and persistent lookups."""
-            key = f"{tag_type}:{tag.strip().lower()}"
+            """Store a result in local_research, shared cache, and persistent lookups."""
+            clean_tag, label = _strip_label(tag)
+            key = f"{tag_type}:{clean_tag.strip().lower()}"
             local_research[key] = result
             persistent_lookups[key] = result
             if research_cache is not None:
                 research_cache[key] = result
+            if label:
+                _label_to_keys.setdefault(label, []).append(key)
+            _manifest[key] = {"round": round_num, "tag_type": tag_type, "arg": clean_tag}
 
         async def _locked_lookup(tag_type: str, tag: str, run_fn) -> str:
-            """Run a lookup with a per-key lock to prevent duplicate concurrent executions."""
-            key = f"{tag_type}:{tag.strip().lower()}"
+            """Run a lookup with a per-key lock to prevent duplicate concurrent executions.
+            For non-CODE/KEEP types: if the result is already in the shared cache
+            (from another parallel model), return it directly and record it as seen
+            by this model — no re-execution, no wasted API call."""
+            clean_tag, label = _strip_label(tag)
+            key = f"{tag_type}:{clean_tag.strip().lower()}"
             if key not in _inflight_locks:
                 _inflight_locks[key] = asyncio.Lock()
             lock = _inflight_locks[key]
 
             async with lock:
-                # CODE always re-runs — file may have changed (e.g. after edits)
                 if tag_type not in ("CODE", "KEEP"):
                     if research_cache is not None and key in research_cache:
                         result = research_cache[key]
+                        # Record as seen by this model (local_research + manifest)
+                        local_research[key] = result
                         persistent_lookups[key] = result
+                        if label:
+                            _label_to_keys.setdefault(label, []).append(key)
+                        _manifest[key] = {"round": round_num,
+                                          "tag_type": tag_type, "arg": clean_tag}
                         return result
-                # Run the lookup
-                result = run_fn(tag)
+                result = run_fn(clean_tag)
                 if asyncio.iscoroutine(result):
                     result = await result
                 _store(tag_type, tag, result)
                 return result
 
-        total = len(code_tags) + len(web_tags) + len(detail_tags) + len(file_tags) + len(refs_tags) + len(purpose_tags) + len(lsp_tags) + len(knowledge_tags) + len(keep_tags)
-        status(f"  Tool use round {round_num}: {total} lookups")
+        # ── Handle [DISCARD: #label] — remove labeled results from context ──
+        if discard_tags:
+            for label in discard_tags:
+                if label in _label_to_keys:
+                    for key in _label_to_keys[label]:
+                        persistent_lookups.pop(key, None)
+                        local_research.pop(key, None)
+                    status(f"  Discarded #{label} ({len(_label_to_keys[label])} results)")
+                    del _label_to_keys[label]
+                else:
+                    warn(f"  [DISCARD: #{label}] — label not found, ignoring")
+
+        total = len(code_tags) + len(web_tags) + len(detail_tags) + len(file_tags) + len(refs_tags) + len(purpose_tags) + len(semantic_tags) + len(lsp_tags) + len(knowledge_tags) + len(keep_tags)
+        mode = _describe_tool_mode(result)
+        tags_desc = _tag_summary(
+            code_tags, web_tags, detail_tags, file_tags, refs_tags,
+            purpose_tags, semantic_tags, lsp_tags, knowledge_tags, keep_tags,
+            research_cache, persistent_lookups,
+        )
+        status(f"  [{model.split('/')[-1]}] tool round {round_num}/{max_rounds}: "
+               f"{total} lookup(s) — {mode}")
+        status(f"    tags: {tags_desc}")
+
+        # ── Stall detection ────────────────────────────────────────────
+        # Build a stable key set for THIS round's tag requests so we can
+        # tell whether the model is making progress or just re-requesting
+        # already-cached lookups. If two consecutive rounds request only
+        # tools whose results are already in persistent_lookups, the model
+        # is spinning — break out and let it commit.
+        def _norm_tag_key(tag_type: str, tag_arg: str) -> str:
+            clean, _ = _strip_label(tag_arg)
+            return f"{tag_type}:{clean.strip().lower()}"
+
+        round_keys: set[str] = set()
+        for t in code_tags:    round_keys.add(_norm_tag_key("SEARCH", t))
+        for t in web_tags:     round_keys.add(_norm_tag_key("WEBSEARCH", t))
+        for t in detail_tags:  round_keys.add(_norm_tag_key("DETAIL", t))
+        for t in file_tags:    round_keys.add(_norm_tag_key("CODE", t))
+        for t in refs_tags:    round_keys.add(_norm_tag_key("REFS", t))
+        for t in purpose_tags: round_keys.add(_norm_tag_key("PURPOSE", t))
+        for t in lsp_tags:     round_keys.add(_norm_tag_key("LSP", t))
+        for t in knowledge_tags: round_keys.add(_norm_tag_key("KNOWLEDGE", t))
+        for t in keep_tags:    round_keys.add(_norm_tag_key("KEEP", t))
+
+        # A round is "stalled" if every key was already run by this model.
+        # We do NOT check the shared research_cache — results from other parallel
+        # models are new to this model and must not trigger false stall detection.
+        def _is_cached(k: str) -> bool:
+            if k.split(':', 1)[0] in ('CODE', 'KEEP'):
+                return False  # always fresh — file may have changed
+            return k in local_research
+
+        if round_keys and all(_is_cached(k) for k in round_keys):
+            _stall_rounds += 1
+        elif round_keys == _last_round_keys and round_keys:
+            _stall_rounds += 1
+        else:
+            _stall_rounds = 0
+        _last_round_keys = round_keys
+
+        if _stall_rounds >= 2:
+            warn(
+                f"  Stall: round {round_num} repeated already-cached lookups. "
+                f"Forcing the model to commit instead of looping."
+            )
+            # Inject a hard commit instruction and let the loop run ONE more
+            # turn so the model can emit its plan/code, then break.
+            stall_note = (
+                "\n\n══════════════════════════════════════════════════════════════════════\n"
+                "🛑 STOP INVESTIGATING — COMMIT NOW\n"
+                "══════════════════════════════════════════════════════════════════════\n"
+                "You have spent multiple rounds re-requesting the SAME tool results.\n"
+                "Investigation is over. Write your final answer NOW using only what\n"
+                "you already know. Do NOT use any more tool tags. Do NOT write [STOP].\n"
+                "If you are a planner: WRITE THE PLAN.\n"
+                "If you are a coder: WRITE THE EDIT BLOCKS, then [DONE].\n"
+                "══════════════════════════════════════════════════════════════════════\n"
+            )
+            current_prompt = current_prompt + stall_note
+            # Force one final round with no tool processing
+            try:
+                final_result = await call_with_retry(
+                    model, current_prompt, max_tokens=max_tokens,
+                    stop_check=None,  # no early stop — let it write everything
+                    log_label=log_label + " (commit)",
+                )
+                # Strip any remaining signals
+                final_result = DONE_TAG.sub('', final_result)
+                final_result = STOP_TAG.sub('', final_result).rstrip()
+                full_response += "\n" + final_result
+            except Exception as e:
+                warn(f"  Forced-commit round failed: {e}")
+            break
 
         if code_tags and project_root:
             new_tags, cached = _cached_or_run("SEARCH", code_tags)
@@ -646,7 +1153,7 @@ async def call_with_tools(
             round_output += cached
             for t in new_tags:
                 async def _code_fn(tag):
-                    return _run_code_reads([tag], project_root)
+                    return _run_code_reads([tag], project_root, viewed_versions=viewed_versions)
                 r = await _locked_lookup("CODE", t, _code_fn)
                 round_output += r
 
@@ -665,6 +1172,22 @@ async def call_with_tools(
                 async def _purpose_fn(tag):
                     return _run_purpose_lookups([tag], purpose_map, project_root)
                 r = await _locked_lookup("PURPOSE", t, _purpose_fn)
+                round_output += r
+
+        if semantic_tags and purpose_map and project_root:
+            new_tags, cached = _cached_or_run("SEMANTIC", semantic_tags)
+            round_output += cached
+            for t in new_tags:
+                async def _semantic_fn(tag):
+                    from pathlib import Path as _Path
+                    from tools.code_index import _maps_dir, _load_all_code
+                    from tools.embeddings import semantic_retrieve
+                    maps_dir = _maps_dir(project_root)
+                    _, file_hash = _load_all_code(project_root)
+                    return await semantic_retrieve(
+                        tag, purpose_map, project_root, maps_dir, file_hash, top_n=10
+                    )
+                r = await _locked_lookup("SEMANTIC", t, _semantic_fn)
                 round_output += r
 
         if lsp_tags and project_root:
@@ -689,6 +1212,7 @@ async def call_with_tools(
             keep_result = await _run_keep(
                 keep_tags, project_root,
                 persistent_lookups, research_cache,
+                viewed_versions=viewed_versions,
             )
             round_output += keep_result
 
@@ -704,18 +1228,92 @@ async def call_with_tools(
                 "Do NOT re-request the same lookups — they will fail again.\n"
             )
 
-        # Build continuation prompt
+        # Build continuation prompt — include explicit round budget so the
+        # model feels time pressure to commit instead of looping. After the
+        # halfway mark we escalate: "wrap up". Past the threshold, we say
+        # "STOP investigating, COMMIT NOW".
+        budget_msg = ""
+        rounds_used = round_num
+        rounds_left = max_rounds - rounds_used
+        if rounds_left <= 0:
+            budget_msg = (
+                "\n⛔ NO TOOL ROUNDS LEFT. This is your FINAL response. "
+                "Write your plan/edits NOW. Do NOT use any more tool tags."
+            )
+        elif rounds_used >= max(3, max_rounds * 2 // 3):
+            budget_msg = (
+                f"\n⚠ Round {rounds_used}/{max_rounds}. {rounds_left} round(s) left. "
+                "Wrap up investigation and commit to your answer. Use tools ONLY if "
+                "absolutely required to fill a remaining gap."
+            )
+        elif rounds_used >= max(2, max_rounds // 2):
+            budget_msg = (
+                f"\n• Round {rounds_used}/{max_rounds}. You have {rounds_left} round(s) left. "
+                "Prefer committing over more investigation when in doubt."
+            )
+
+        # ── Build tagged round history ────────────────────────────────
+        round_history_parts = []
+        for i, rt in enumerate(_round_texts):
+            rn = i + 1
+            round_history_parts.append(
+                f"[Thinking — Round {rn}]\n{rt}\n[/Thinking — Round {rn}]"
+            )
+        round_history = "\n\n".join(round_history_parts)
+
+        # ── Build context manifest ────────────────────────────────────
+        def _manifest_line(k: str, v: dict) -> str:
+            arg = v["arg"]
+            tt  = v["tag_type"]
+            rn  = v["round"]
+            result_text = persistent_lookups.get(k, "")
+            lines_hint = ""
+            m = re.search(r'\((\d+) lines\)', result_text)
+            if m:
+                lines_hint = f" — {m.group(1)} lines"
+            elif "KEPT" in result_text:
+                m2 = re.search(r'KEPT (\d+/\d+ lines)', result_text)
+                if m2:
+                    lines_hint = f" — {m2.group(1)} kept"
+            return f"  [{tt}: {arg}] (R{rn}{lines_hint})"
+
+        manifest_lines = ["══ CONTEXT MANIFEST — what you have actually read ══"]
+        if _manifest:
+            manifest_lines.extend(_manifest_line(k, v) for k, v in _manifest.items())
+        else:
+            manifest_lines.append("  (no tool results yet)")
+        manifest_lines.append(
+            "⚠ HARD RULE: Any file or result NOT listed above is UNKNOWN to you.\n"
+            "  Do NOT reference, quote, or reason about content you have not seen.\n"
+            "  If you need a file that is not listed — request it with a tool tag.\n"
+            "══"
+        )
+        manifest_str = "\n".join(manifest_lines)
+
         current_prompt = f"""{prompt}
 
-YOUR PREVIOUS THINKING (you wrote this — continue from where you stopped):
-{full_response}
+══════════════════════════════════════════════════════════════════════
+YOUR THINKING SO FAR — by round
+══════════════════════════════════════════════════════════════════════
+{round_history}
 
-LOOKUP RESULTS (you requested these mid-thought):
+══════════════════════════════════════════════════════════════════════
+RESULTS YOU REQUESTED — Round {round_num} results now available
+══════════════════════════════════════════════════════════════════════
 {search_output}
 
-Continue from where you left off. You now have the results.
-If you need MORE info, write new tags. You can re-read files if needed.
-When you are FINISHED (your final answer is complete), write [DONE] at the end.
-Do NOT repeat what you already wrote above — just continue."""
+{manifest_str}
+{budget_msg}
 
-    return {"model": model, "answer": full_response, "research": local_research}
+▶ Continue naturally depending on where you were:
+  • Mid-plan or mid-analysis? Keep writing it — use the results above to fill the gap.
+  • Your thinking ended with "waiting for results" or "let me check X"? You have the
+    results now — no need to wait, proceed directly.
+  • Just needed a quick fact? Use it and move on.
+
+  Do NOT repeat or restate what you wrote above — pick up from where you left off.
+  Do NOT re-request lookups already shown above — they are cached.
+  Need more lookups? Write new tags and [STOP].
+  Ready to submit? Write edits then [DONE] (or finish naturally if no edits)."""
+
+    return {"model": model, "answer": full_response, "done": _done_signaled, "research": local_research}

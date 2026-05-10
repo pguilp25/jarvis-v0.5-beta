@@ -18,7 +18,7 @@ async def call_api(
     json_mode: bool = False,
 ) -> str:
     """
-    Call any model by its config name (e.g. 'groq/kimi-k2', 'nvidia/deepseek-v3.2').
+    Call any model by its config name (e.g. 'groq/kimi-k2', 'nvidia/deepseek-v4-pro').
     Routes to the correct provider client automatically.
     """
     provider = MODELS[model_id]["provider"]

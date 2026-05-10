@@ -142,7 +142,7 @@ async def expand_prompt(user_query: str, context: str = "", last_exchange: str =
     """
     Use NVIDIA MiniMax to expand a short image request into a detailed prompt.
     Passes conversation context so it can resolve references.
-    Falls back to nvidia/deepseek-v3.2 if MiniMax fails.
+    Falls back to nvidia/deepseek-v4-pro if MiniMax fails.
     """
     step("Prompt Expansion (MiniMax)")
 
@@ -167,7 +167,7 @@ async def expand_prompt(user_query: str, context: str = "", last_exchange: str =
     except Exception as e:
         warn(f"MiniMax failed ({e}) — falling back to DeepSeek v3.2")
         expanded = await call_with_retry(
-            "nvidia/deepseek-v3.2",
+            "nvidia/deepseek-v4-pro",
             prompt=prompt,
             system=EXPAND_SYSTEM,
             temperature=0.7,

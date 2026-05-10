@@ -32,7 +32,7 @@ async def call_nvidia(
     json_mode: bool = False,
 ) -> str:
     """
-    Call an NVIDIA model. model_id is our config name like 'nvidia/deepseek-v3.2'.
+    Call an NVIDIA model. model_id is our config name like 'nvidia/deepseek-v4-pro'.
     Acquires rate limiter before calling. Returns response text.
     """
     await nvidia_limiter.acquire()
@@ -112,6 +112,10 @@ async def call_nvidia_stream(
     }
 
     chunks: list[str] = []
+    # Visible-only buffer: stop_check must NEVER see reasoning_content. A
+    # reasoning model that mentions "[STOP]" in its CoT would otherwise trigger
+    # an early-stop while still thinking. Track visible content separately.
+    visible_chunks: list[str] = []
     async with aiohttp.ClientSession() as session:
         async with session.post(
             NVIDIA_API_URL, json=payload, headers=headers,
@@ -121,11 +125,9 @@ async def call_nvidia_stream(
                 body = await resp.text()
                 raise RuntimeError(f"NVIDIA {api_model} HTTP {resp.status}: {body[:200]}")
 
-            # Buffer raw bytes, split on newlines to produce complete SSE event lines.
-            # Reading in arbitrary chunks from iter_any() can split a line mid-way,
-            # which would break JSON parsing of the "data: {...}" payload.
             buf = b""
             done = False
+            in_thinking_block = False
             async for raw in resp.content.iter_any():
                 buf += raw
                 while b"\n" in buf:
@@ -139,20 +141,44 @@ async def call_nvidia_stream(
                         break
                     try:
                         obj = _json.loads(data)
-                        delta = obj["choices"][0]["delta"].get("content", "")
+                        delta_obj = obj["choices"][0]["delta"]
+                        # ── Reasoning content (hidden CoT) ──
+                        # Some servers use `reasoning`, others `reasoning_content`.
+                        reasoning = (
+                            delta_obj.get("reasoning_content")
+                            or delta_obj.get("reasoning")
+                            or ""
+                        )
+                        if reasoning:
+                            if not in_thinking_block:
+                                opener = "<think>"
+                                chunks.append(opener)
+                                thought_logger.write_chunk(model_id, opener)
+                                in_thinking_block = True
+                            chunks.append(reasoning)
+                            thought_logger.write_chunk(model_id, reasoning)
+                        # ── Visible content ──
+                        delta = delta_obj.get("content") or ""
                         if delta:
+                            if in_thinking_block:
+                                closer = "</think>\n\n"
+                                chunks.append(closer)
+                                thought_logger.write_chunk(model_id, closer)
+                                in_thinking_block = False
                             chunks.append(delta)
+                            visible_chunks.append(delta)
                             thought_logger.write_chunk(model_id, delta)
-                            # Check stop on ] (tool tags) or \n (cycle detection)
                             if stop_check and ("]" in delta or "\n" in delta):
-                                accumulated = "".join(chunks)
-                                if stop_check(accumulated):
+                                if stop_check("".join(visible_chunks)):
                                     done = True
                                     break
                     except (ValueError, KeyError, IndexError):
                         pass
                 if done:
                     break
+            if in_thinking_block:
+                chunks.append("</think>\n\n")
+                thought_logger.write_chunk(model_id, "</think>\n\n")
 
     return "".join(chunks)
 

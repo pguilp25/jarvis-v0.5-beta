@@ -29,7 +29,7 @@ def to_forward_slash(p: str) -> str:
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
-MAX_FILE_SIZE = 50_000       # chars — skip huge files
+LARGE_FILE_THRESHOLD = 50_000  # chars — warn to use KEEP above this
 MAX_SEARCH_RESULTS = 30      # ripgrep matches
 IGNORE_DIRS = {
     # Python
@@ -156,12 +156,11 @@ def _human_size(n: int) -> str:
 # ─── File Reading ────────────────────────────────────────────────────────────
 
 def read_file(path: str) -> str | None:
-    """Read a file, return content or None if too large / binary."""
+    """Read a file, return raw content or None if binary / unreadable.
+    No size limit — callers add KEEP hints based on LARGE_FILE_THRESHOLD."""
     p = Path(norm_path(path))
     if not p.exists():
         return None
-    if p.stat().st_size > MAX_FILE_SIZE:
-        return f"[FILE TOO LARGE: {_human_size(p.stat().st_size)} — skipped]"
     if p.suffix in IGNORE_EXTENSIONS:
         return f"[BINARY FILE: {p.suffix} — skipped]"
     try:
@@ -177,34 +176,40 @@ def read_files(paths: list[str]) -> dict[str, str]:
 
 # ─── Code Search (ripgrep) ──────────────────────────────────────────────────
 
-def _make_whitespace_visible(line: str) -> str:
-    """Render leading whitespace visibly so the model can see tabs vs spaces.
 
-    Spaces → ⁃ (U+2043 hyphen bullet — visually distinct from period)
-    Tabs   → → (U+2192 rightwards arrow)
-    Only the LEADING whitespace is transformed — the rest of the line is left
-    as-is so the code itself stays readable.
+def add_line_numbers(content: str) -> str:
+    """Add line numbers to code content in the iN| format the model expects.
+
+    Format per line:  iN|{code without leading whitespace} {lineno}
+    where N is the number of leading spaces (tabs are expanded to TAB_WIDTH=4)
+    and {lineno} is separated from the code by a single space — matching the
+    format the prompts document and the format _filter_by_ranges (used by KEEP)
+    produces. Reading and writing are symmetric across [CODE:] and [KEEP:].
+
+    Examples:
+       def foo():        →  i0|def foo() 10
+           return 1      →  i4|return 1 11
+               pass      →  i8|pass 12
+       (blank)           →  i0| 13
     """
+    TAB_WIDTH = 4
+    lines = content.split('\n')
+    out = []
+    for i, line in enumerate(lines):
+        expanded = line.expandtabs(TAB_WIDTH)
+        stripped = expanded.lstrip(' ')
+        n_indent = len(expanded) - len(stripped)
+        out.append(f"i{n_indent}|{stripped} {i+1}")
+    return '\n'.join(out)
+
+
+def _make_whitespace_visible(line: str) -> str:
+    """Legacy: render leading whitespace visibly. Kept for backwards
+    compatibility with any callers that still want the old format."""
     stripped = line.lstrip()
     prefix = line[:len(line) - len(stripped)]
     visible = prefix.replace('\t', '→').replace(' ', '⁃')
     return visible + stripped
-
-
-def add_line_numbers(content: str) -> str:
-    """Add line numbers to code content. Format: 'code here  │42'
-
-    Numbers go at the END so leading whitespace (indentation) is preserved
-    exactly as-is. Leading whitespace is rendered visibly (· for space, T for
-    tab) so the model can see the exact indentation type and depth and copy it
-    correctly into SEARCH/REPLACE blocks.
-    """
-    lines = content.split('\n')
-    width = len(str(len(lines)))
-    return '\n'.join(
-        f"{_make_whitespace_visible(line)}  │{i+1:>{width}}"
-        for i, line in enumerate(lines)
-    )
 
 
 def extract_relevant_sections(
@@ -311,8 +316,9 @@ def search_code(pattern: str, root: str, max_results: int = MAX_SEARCH_RESULTS) 
         cmd = [
             "rg", "--line-number", "--no-heading", "--color=never",
             "--max-count=5",  # max 5 matches per file
-            "--max-filesize=100K",
-            "-C", "25",  # 25 lines context above and below
+            # No --max-filesize: old 100K cap silently skipped large files
+            # (e.g. workflows/code.py at 260KB) — giving false "no results".
+            "-C", "5",  # 5 lines context (was 25 — most was wasted)
             *ignore_args,
             pattern, root,
         ]
@@ -517,19 +523,25 @@ def search_refs(name: str, root: str, max_results: int = 30) -> str:
     for suffix in IGNORE_DIR_SUFFIXES:
         ignore_args.extend(["--glob", f"!*{suffix}/"])
 
-    # Use ripgrep with word boundary
+    # Use ripgrep with word boundary.
+    # No --max-filesize: the old 200K cap silently skipped large files like
+    # workflows/code.py (260KB), causing REFS to return empty results even
+    # when the symbol was clearly defined there.
+    # No -C context: ripgrep context lines use a dash separator which the old
+    # split(':', 2) parser dropped entirely. We now use _parse_rg_output which
+    # handles both separators, so context works correctly.
     try:
         cmd = [
             "rg", "--line-number", "--no-heading", "--color=never",
-            "--max-count=10", "--max-filesize=200K",
+            "--max-count=10",
             "-w",  # word boundary match
-            "-C", "25",  # 25 lines context
+            "-C", "3",  # 3 lines context — enough to see usage without bloat
             *ignore_args,
             name, root,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if result.returncode > 1:
-            return f"Search for '{name}': no results"
+            return f"Search for '{name}': ripgrep error (rc={result.returncode})"
     except FileNotFoundError:
         # Fallback to grep
         try:
@@ -537,6 +549,7 @@ def search_refs(name: str, root: str, max_results: int = 30) -> str:
                 "grep", "-rnw", "--include=*.py", "--include=*.js", "--include=*.ts",
                 "--include=*.jsx", "--include=*.tsx", "--include=*.c", "--include=*.cpp",
                 "--include=*.h", "--include=*.rs", "--include=*.java", "--include=*.lean",
+                "-C", "3",
                 name, root,
             ]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
@@ -548,22 +561,22 @@ def search_refs(name: str, root: str, max_results: int = 30) -> str:
     if not result.stdout.strip():
         return f"Search for '{name}': no matches found"
 
+    # Parse with _parse_rg_output which handles both match lines (`:` sep) and
+    # context lines (`-` sep). Old split(':', 2) silently dropped context lines.
+    raw_results = _parse_rg_output(result.stdout, max_results)
+
+    if not raw_results:
+        return f"Search for '{name}': no matches found"
+
     # Categorize results
     definitions = []
     imports = []
     usages = []
 
-    for line in result.stdout.strip().split('\n')[:max_results]:
-        # Parse "filepath:linenum:content"
-        parts = line.split(':', 2)
-        if len(parts) < 3:
-            continue
-        filepath = parts[0]
-        try:
-            linenum = int(parts[1])
-        except ValueError:
-            continue
-        content = parts[2].strip()
+    for item in raw_results:
+        filepath = item["file"]
+        linenum  = item["line_num"]
+        content  = item["line"]
 
         # Make path relative
         try:
@@ -573,7 +586,7 @@ def search_refs(name: str, root: str, max_results: int = 30) -> str:
 
         entry = f"  {rel}:{linenum}  {content}"
 
-        # Categorize
+        # Categorize based on line content
         stripped = content.lstrip()
         if any(stripped.startswith(kw) for kw in [
             f"def {name}", f"class {name}", f"async def {name}",

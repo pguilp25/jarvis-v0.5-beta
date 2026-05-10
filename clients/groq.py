@@ -112,6 +112,9 @@ async def call_groq_stream(
     }
 
     chunks: list[str] = []
+    # stop_check must only see VISIBLE content. If the model writes "[STOP]"
+    # inside its CoT, the early-stop must NOT fire.
+    visible_chunks: list[str] = []
     async with aiohttp.ClientSession() as session:
         async with session.post(
             GROQ_API_URL, json=payload, headers=headers,
@@ -121,11 +124,9 @@ async def call_groq_stream(
                 body = await resp.text()
                 raise RuntimeError(f"Groq {api_model} HTTP {resp.status}: {body[:200]}")
 
-            # Buffer raw bytes, split on newlines to produce complete SSE event lines.
-            # Reading in arbitrary chunks from iter_any() can split a line mid-way,
-            # which would break JSON parsing of the "data: {...}" payload.
             buf = b""
             done = False
+            in_thinking_block = False
             async for raw in resp.content.iter_any():
                 buf += raw
                 while b"\n" in buf:
@@ -139,20 +140,35 @@ async def call_groq_stream(
                         break
                     try:
                         obj = _json.loads(data)
-                        delta = obj["choices"][0]["delta"].get("content", "")
+                        delta_obj = obj["choices"][0]["delta"]
+                        reasoning = delta_obj.get("reasoning") or delta_obj.get("reasoning_content") or ""
+                        if reasoning:
+                            if not in_thinking_block:
+                                chunks.append("<think>")
+                                thought_logger.write_chunk(model_id, "<think>")
+                                in_thinking_block = True
+                            chunks.append(reasoning)
+                            thought_logger.write_chunk(model_id, reasoning)
+                        delta = delta_obj.get("content") or ""
                         if delta:
+                            if in_thinking_block:
+                                chunks.append("</think>\n\n")
+                                thought_logger.write_chunk(model_id, "</think>\n\n")
+                                in_thinking_block = False
                             chunks.append(delta)
+                            visible_chunks.append(delta)
                             thought_logger.write_chunk(model_id, delta)
-                            # Check stop on ] (tool tags) or \n (cycle detection)
                             if stop_check and ("]" in delta or "\n" in delta):
-                                accumulated = "".join(chunks)
-                                if stop_check(accumulated):
+                                if stop_check("".join(visible_chunks)):
                                     done = True
                                     break
                     except (ValueError, KeyError, IndexError):
                         pass
                 if done:
                     break
+            if in_thinking_block:
+                chunks.append("</think>\n\n")
+                thought_logger.write_chunk(model_id, "</think>\n\n")
 
     return "".join(chunks)
 

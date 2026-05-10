@@ -141,7 +141,7 @@ IMPOSSIBLE — the problem cannot be fully solved, accept partial answer"""
 # ─── Conjecture Runner ──────────────────────────────────────────────────────
 
 NVIDIA_MODELS = [
-    "nvidia/deepseek-v3.2",
+    "nvidia/deepseek-v4-pro",
     "nvidia/glm-5",
     "nvidia/minimax-m2.5",
     "nvidia/qwen-3.5",

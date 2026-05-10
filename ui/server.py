@@ -29,7 +29,10 @@ _project_root: str = ""
 _pending_sandbox = None
 _pending_maps = None
 _ws_clients: list = []  # use list to avoid set mutation issues
-_current_task: asyncio.Task | None = None  # track current processing for stop
+_current_task: asyncio.Task | None = None # track current processing for stop
+_current_task_conv_id: str = "" # tracks which conversation the current task belongs to
+_thinking_buffers: dict = {} # {conv_id: {"headers": [...], "chunks": [...]}}
+_last_model_name: str = ""
 
 CONV_DIR = Path.home() / ".jarvis" / "conversations"
 
@@ -50,6 +53,7 @@ def _load_conversations():
                         d = json.loads(mp.read_text())
                         mem.full_history = d.get("history", [])
                         mem.compressed_context = d.get("compressed")
+                        mem._msg_counter = d.get("msg_counter", len(mem.full_history))
                     except Exception:
                         pass
                 _conversations[cid] = {"name": info.get("name", "Chat"), "memory": mem}
@@ -75,7 +79,7 @@ def _save_conv_memory(cid):
     if cid not in _conversations:
         return
     mem = _conversations[cid]["memory"]
-    d = {"history": mem.full_history, "compressed": mem.compressed_context}
+    d = {"history": mem.full_history, "compressed": mem.compressed_context, "msg_counter": mem._msg_counter}
     (CONV_DIR / f"{cid}.json").write_text(json.dumps(d))
 
 
@@ -91,14 +95,21 @@ def _build_history(cid):
     out = []
     for m in _conversations[cid]["memory"].full_history:
         if m.get("role") in ("user", "assistant"):
-            out.append({"role": m["role"], "text": m.get("content", "")})
+            entry = {"role": m["role"], "text": m.get("content", "")}
+            if m.get("thinking_trace"):
+                entry["thinking_trace"] = m["thinking_trace"]
+            out.append(entry)
     return out
 
 
 # ─── Broadcasting ────────────────────────────────────────────────────────────
 
-async def _broadcast(msg_type, data):
+async def _broadcast(msg_type, data, conv_id=None):
     payload = json.dumps({"type": msg_type, **data})
+    if conv_id:
+        # Tag payload so clients can filter by conversation
+        # We inject conv_id into the JSON after serialization for efficiency
+        payload = payload[:-1] + f',"conv_id":"{conv_id}"}}'
     to_remove = []
     for i, ws in enumerate(_ws_clients):
         try:
@@ -118,24 +129,47 @@ _orig_chunk = thought_logger.write_chunk
 def _hook_header(model_id, label=""):
     _orig_header(model_id, label)
     name = model_id.split("/")[-1]
+    global _last_model_name
+    _last_model_name = name
+    header = {"model": name, "label": label}
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            loop.create_task(_broadcast("thinking_header", {"model": name, "label": label}))
+            loop.create_task(_broadcast("thinking_header", header, conv_id=_current_task_conv_id))
     except RuntimeError:
         pass
+    buf = _thinking_buffers.get(_current_task_conv_id)
+    if buf is not None:
+        buf["headers"].append(header)
+        buf["chunks"].append([])
+        buf["curIdx"] = len(buf["headers"]) - 1
 
 
 def _hook_chunk(model_id, chunk):
     _orig_chunk(model_id, chunk)
     if chunk:
         name = model_id.split("/")[-1]
+        entry = {"model": name, "chunk": chunk}
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                loop.create_task(_broadcast("thinking_chunk", {"model": name, "chunk": chunk}))
+                loop.create_task(_broadcast("thinking_chunk", entry, conv_id=_current_task_conv_id))
         except RuntimeError:
             pass
+        buf = _thinking_buffers.get(_current_task_conv_id)
+        if buf is not None:
+            # Route to the most recent header slot with this model name.
+            # When parallel models all send headers first then chunks, curIdx
+            # ends up pointing at the last model — all chunks would go there.
+            # Matching by model name ensures each parallel model's chunks land
+            # in its own slot.
+            target_idx = buf["curIdx"]  # fallback
+            for i in range(len(buf["headers"]) - 1, -1, -1):
+                if buf["headers"][i]["model"] == name:
+                    target_idx = i
+                    break
+            if 0 <= target_idx < len(buf["chunks"]):
+                buf["chunks"][target_idx].append(chunk)
 
 
 thought_logger.write_header = _hook_header
@@ -150,7 +184,7 @@ def _hook_status(msg, color="cyan"):
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            loop.create_task(_broadcast("status", {"text": msg, "color": color}))
+            loop.create_task(_broadcast("status", {"text": msg, "color": color}, conv_id=_current_task_conv_id))
     except RuntimeError:
         pass
 
@@ -165,7 +199,7 @@ async def handle_index(request):
 
 
 async def handle_ws(request):
-    global _active_conv, _project_root, _pending_sandbox, _pending_maps
+    global _active_conv, _project_root, _pending_sandbox, _pending_maps, _current_task_conv_id, _current_task
 
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -177,6 +211,8 @@ async def handle_ws(request):
         "conversations": {c: _conversations[c]["name"] for c in _conversations},
         "active": _active_conv,
         "history": _build_history(_active_conv),
+        "processing": _current_task_conv_id if (_current_task and not _current_task.done()) else "",
+        "thinking_buffer": _thinking_buffers.get(_active_conv) if (_current_task and not _current_task.done() and _current_task_conv_id == _active_conv) else None,
     })
 
     try:
@@ -186,11 +222,11 @@ async def handle_ws(request):
                 a = data.get("action", "")
                 if a == "message":
                     # Run processing in a separate task so WS loop stays responsive
-                    global _current_task
                     if _current_task and not _current_task.done():
                         await ws.send_json({"type": "response", "text": "Already processing. Click stop first.", "is_system": True})
                     else:
-                        _current_task = asyncio.create_task(_on_message(ws, data.get("text", "")))
+                        _current_task_conv_id = _active_conv
+                        _current_task = asyncio.create_task(_on_message(ws, data.get("text", ""), _active_conv))
                 elif a == "stop":
                     if _current_task and not _current_task.done():
                         _current_task.cancel()
@@ -221,19 +257,62 @@ async def handle_ws(request):
     return ws
 
 
-async def _on_message(ws, text):
+def _flush_thinking_buffer(conv_id):
+    """Write buffer content to the last assistant memory entry, then discard."""
+    buf = _thinking_buffers.pop(conv_id, None)
+    if not buf or not buf.get("headers"):
+        # Fallback: if a trace was set without model names,
+        # enhance it with the last known model name
+        if conv_id in _conversations and _last_model_name:
+            mem = _conversations[conv_id]["memory"]
+            for entry in reversed(mem.full_history):
+                if entry.get("role") == "assistant" and entry.get("thinking_trace"):
+                    trace = entry["thinking_trace"]
+                    # Only enhance if trace is not already JSON
+                    try:
+                        json.loads(trace)
+                    except (json.JSONDecodeError, TypeError):
+                        # Legacy trace: single blob, wrap as one JSON call
+                        entry["thinking_trace"] = json.dumps([{
+                            "model": _last_model_name,
+                            "label": "",
+                            "content": trace
+                        }])
+                break
+        return
+    if conv_id not in _conversations:
+        return
+    calls = []
+    for i, hdr in enumerate(buf["headers"]):
+        chunks = buf["chunks"][i] if i < len(buf["chunks"]) else []
+        calls.append({
+            "model": hdr["model"],
+            "label": hdr.get("label", ""),
+            "content": "".join(chunks)
+        })
+    trace = json.dumps(calls)
+    if not trace or trace == "[]":
+        return
+    mem = _conversations[conv_id]["memory"]
+    for entry in reversed(mem.full_history):
+        if entry.get("role") == "assistant":
+            entry["thinking_trace"] = trace
+            return
+
+
+async def _on_message(ws, text, conv_id):
     global _pending_sandbox, _pending_maps
     if not text.strip():
         return
 
-    memory = _get_memory()
+    memory = _conversations[conv_id]["memory"] if conv_id in _conversations else ConversationMemory()
 
     from main import handle_slash_command
     sr = handle_slash_command(text, memory)
     if sr is not None:
         await ws.send_json({"type": "response", "text": sr, "is_system": True})
-        if _active_conv:
-            _save_conv_memory(_active_conv)
+        if conv_id:
+            _save_conv_memory(conv_id)
         return
 
     if text.strip().lower().startswith("/index"):
@@ -257,7 +336,8 @@ async def _on_message(ws, text):
             display_text = display_text[len(prefix):].strip()
             break
 
-    await _broadcast("thinking_start", {})
+    await _broadcast("thinking_start", {}, conv_id=conv_id)
+    _thinking_buffers[conv_id] = {"headers": [], "chunks": [], "done": False, "curIdx": -1}
     try:
         import main as _m
         _m._project_root = _project_root
@@ -266,34 +346,37 @@ async def _on_message(ws, text):
 
         _pending_sandbox = _m._pending_sandbox
         _pending_maps = _m._pending_maps
-        await _broadcast("thinking_end", {})
-        await ws.send_json({"type": "response", "text": answer, "is_system": False})
+        _flush_thinking_buffer(conv_id)
+        await _broadcast("thinking_end", {}, conv_id=conv_id)
+        await ws.send_json({"type": "response", "text": answer, "is_system": False, "conv_id": conv_id})
 
         if _pending_sandbox:
             await ws.send_json({"type": "sandbox_prompt", "diff": _pending_sandbox.get_all_diffs()})
 
         # Auto-name conversation with AI
-        if _active_conv and _conversations[_active_conv]["name"] == "New Chat":
-            await _auto_name_conv(_active_conv, display_text)
+        if conv_id and _conversations[conv_id]["name"] == "New Chat":
+            await _auto_name_conv(conv_id, display_text)
 
-        if _active_conv:
-            _save_conv_memory(_active_conv)
+        if conv_id:
+            _save_conv_memory(conv_id)
     except asyncio.CancelledError:
-        await _broadcast("thinking_end", {})
-        await ws.send_json({"type": "response", "text": "Stopped.", "is_system": True})
+        _flush_thinking_buffer(conv_id)
+        await _broadcast("thinking_end", {}, conv_id=conv_id)
+        await ws.send_json({"type": "response", "text": "Stopped.", "is_system": True, "conv_id": conv_id})
         # Save whatever got added to memory before cancellation
-        if _active_conv:
-            _save_conv_memory(_active_conv)
-            if _conversations[_active_conv]["name"] == "New Chat":
-                await _auto_name_conv(_active_conv, display_text)
+        if conv_id:
+            _save_conv_memory(conv_id)
+            if _conversations[conv_id]["name"] == "New Chat":
+                await _auto_name_conv(conv_id, display_text)
     except Exception as e:
-        await _broadcast("thinking_end", {})
-        await ws.send_json({"type": "response", "text": f"Error: {e}", "is_system": True})
+        _flush_thinking_buffer(conv_id)
+        await _broadcast("thinking_end", {}, conv_id=conv_id)
+        await ws.send_json({"type": "response", "text": f"Error: {e}", "is_system": True, "conv_id": conv_id})
         # Save whatever got added to memory before error
-        if _active_conv:
-            _save_conv_memory(_active_conv)
-            if _conversations[_active_conv]["name"] == "New Chat":
-                await _auto_name_conv(_active_conv, display_text)
+        if conv_id:
+            _save_conv_memory(conv_id)
+            if _conversations[conv_id]["name"] == "New Chat":
+                await _auto_name_conv(conv_id, display_text)
 
 
 async def _auto_name_conv(conv_id: str, user_text: str):
@@ -366,8 +449,9 @@ async def _on_new_conv(ws):
     _active_conv = cid
     _save_conv_meta()
     await _broadcast("conv_list", {
-        "conversations": {c: _conversations[c]["name"] for c in _conversations},
-        "active": _active_conv, "history": [],
+    "conversations": {c: _conversations[c]["name"] for c in _conversations},
+    "active": _active_conv, "history": [],
+    "processing": _current_task_conv_id if (_current_task and not _current_task.done()) else "",
     })
 
 
@@ -380,6 +464,8 @@ async def _on_switch_conv(ws, cid):
     await _broadcast("conv_list", {
         "conversations": {c: _conversations[c]["name"] for c in _conversations},
         "active": _active_conv, "history": _build_history(cid),
+        "processing": _current_task_conv_id if (_current_task and not _current_task.done()) else "",
+        "thinking_buffer": _thinking_buffers.get(cid) if (_current_task and not _current_task.done() and _current_task_conv_id == cid) else None,
     })
 
 
@@ -403,8 +489,9 @@ async def _on_delete_conv(ws, cid):
         _active_conv = next(iter(_conversations))
     _save_conv_meta()
     await _broadcast("conv_list", {
-        "conversations": {c: _conversations[c]["name"] for c in _conversations},
-        "active": _active_conv, "history": _build_history(_active_conv),
+    "conversations": {c: _conversations[c]["name"] for c in _conversations},
+    "active": _active_conv, "history": _build_history(_active_conv),
+    "processing": _current_task_conv_id if (_current_task and not _current_task.done()) else "",
     })
 
 

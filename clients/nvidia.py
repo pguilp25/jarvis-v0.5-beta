@@ -49,7 +49,8 @@ async def call_nvidia(
         "model": api_model,
         "messages": messages,
         "temperature": temperature,
-        # max_tokens removed — no output limit
+        # Output-token floor — see call_nvidia_stream for rationale.
+        "max_tokens": max(int(max_tokens), 4096),
     }
 
     if json_mode:
@@ -98,11 +99,38 @@ async def call_nvidia_stream(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
+    # ── Pre-flight context-budget check ──────────────────────────────
+    # Rough estimate: ~4 chars per token for English/code. If our prompt
+    # is already over the model's typical input cap, fail loudly with a
+    # clear message instead of letting the server return the cryptic
+    # "requested 0 output tokens" HTTP 400 (which happens when the server
+    # computes max_output = context_limit - input and gets 0 or negative).
+    # The threshold is a soft hint — we'd rather warn early than truncate
+    # silently and lose the model's work.
+    _approx_input_chars = sum(len(m.get("content", "")) for m in messages)
+    _approx_input_tokens = _approx_input_chars // 4
+    # Most NVIDIA models we use have 200k-256k context. We reserve 8k
+    # for output and warn at 90% of a conservative 200k input cap.
+    _SOFT_INPUT_CAP = 190_000  # tokens
+    if _approx_input_tokens > _SOFT_INPUT_CAP:
+        from core.cli import warn as _warn
+        _warn(
+            f"  [{model_id.split('/')[-1]}] prompt is ~{_approx_input_tokens:,} "
+            f"tokens — over the {_SOFT_INPUT_CAP:,} soft cap. The model may "
+            f"refuse with HTTP 400 'requested 0 output tokens'. Consider "
+            f"narrowing [KEEP:] ranges or splitting the step."
+        )
+
     payload = {
         "model": api_model,
         "messages": messages,
         "temperature": temperature,
-        # max_tokens removed — no output limit
+        # Reserve a floor for output. Without this, when input nearly fills
+        # the context the server computes max_output = 0 and returns the
+        # opaque "requested 0 output tokens" error. With an explicit floor,
+        # an overflowing request fails with a clear "context exceeded"
+        # message we can surface and handle.
+        "max_tokens": max(int(max_tokens), 4096),
         "stream": True,
     }
 

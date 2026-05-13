@@ -525,13 +525,23 @@ async def _conclude_one(model: str, prompt: str) -> dict:
 
 
 def _format_search_results(results: list[dict]) -> str:
-    """Format search results for prompts."""
+    """Format search results for prompts.
+
+    Uses the `══` block style that the rest of the codebase uses for
+    injected content (cf. tool_call.py / synthesizer.py answer blocks)
+    so models recognize "this is a system-injected block" at a glance.
+    """
     parts = []
     for i, r in enumerate(results):
+        title = r.get("title", "Untitled")
+        url = r.get("url", "N/A")
+        body = r.get("content", "")[:500]
         parts.append(
-            f"[Source {i+1}] {r.get('title', 'Untitled')}\n"
-            f"URL: {r.get('url', 'N/A')}\n"
-            f"{r.get('content', '')[:500]}\n"
+            f"══════════════════════════════════════════════════════════════════════\n"
+            f"SOURCE {i+1} of {len(results)} — {title}\n"
+            f"URL: {url}\n"
+            f"══════════════════════════════════════════════════════════════════════\n"
+            f"{body}\n"
         )
     return "\n".join(parts)
 

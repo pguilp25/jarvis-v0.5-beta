@@ -18,16 +18,19 @@ MODELS = {
     "groq/llama-3.1-8b":     {"window": 128_000, "tpm": 6_000,  "provider": "groq"},
     "groq/qwen3-32b":        {"window": 32_000,  "tpm": 6_000,  "provider": "groq"},
     "groq/gpt-oss-120b":     {"window": 131_000, "tpm": 8_000,  "provider": "groq"},
-    "groq/kimi-k2":          {"window": 262_000, "tpm": 10_000, "provider": "groq"},
     "groq/llama-3.3-70b":    {"window": 128_000, "tpm": 12_000, "provider": "groq"},
     "groq/llama-4-scout":    {"window": 128_000, "tpm": 30_000, "provider": "groq"},
 
     # NVIDIA (free, 40 RPM shared, no TPM limit)
     "nvidia/deepseek-v4-pro":  {"window": 1_000_000, "tpm": None, "provider": "nvidia"},
-    "nvidia/minimax-m2.5":   {"window": 128_000, "tpm": None, "provider": "nvidia"},
+    "nvidia/minimax-m2.7":   {"window": 128_000, "tpm": None, "provider": "nvidia"},
+    "nvidia/kimi-k2.6":      {"window": 256_000, "tpm": None, "provider": "nvidia"},
     "nvidia/qwen-3.5":       {"window": 128_000, "tpm": None, "provider": "nvidia"},
     "nvidia/glm-5":          {"window": 200_000, "tpm": None, "provider": "nvidia"},
     "nvidia/glm-5.1":        {"window": 200_000, "tpm": None, "provider": "nvidia"},
+    # nemotron-super kept as a fallback target only — active workflows now
+    # route to nvidia/kimi-k2.6 instead. If it's deprecated server-side, the
+    # 410 fast-fail in core/retry.py routes downstream automatically.
     "nvidia/nemotron-super": {"window": 1_000_000, "tpm": None, "provider": "nvidia"},
     "nvidia/ultralong-8b":   {"window": 4_000_000, "tpm": None, "provider": "nvidia"},
 
@@ -47,7 +50,6 @@ GROQ_MODEL_IDS = {
     "groq/llama-3.1-8b":  "llama-3.1-8b-instant",
     "groq/qwen3-32b":     "qwen/qwen-3-32b",
     "groq/gpt-oss-120b":  "openai/gpt-oss-120b",
-    "groq/kimi-k2":       "moonshotai/kimi-k2-instruct-0905",
     "groq/llama-3.3-70b": "llama-3.3-70b-versatile",
     "groq/llama-4-scout": "meta-llama/llama-4-scout-17b-16e-instruct",
 }
@@ -56,7 +58,8 @@ GROQ_MODEL_IDS = {
 
 NVIDIA_MODEL_IDS = {
     "nvidia/deepseek-v4-pro":  "deepseek-ai/deepseek-v4-pro",
-    "nvidia/minimax-m2.5":   "minimaxai/minimax-m2.5",
+    "nvidia/minimax-m2.7":   "minimaxai/minimax-m2.7",
+    "nvidia/kimi-k2.6":      "moonshotai/kimi-k2.6",
     "nvidia/qwen-3.5":       "qwen/qwen3.5-397b-a17b",
     "nvidia/glm-5":          "z-ai/glm5",
     "nvidia/glm-5.1":        "z-ai/glm5",
@@ -67,26 +70,26 @@ NVIDIA_MODEL_IDS = {
 # ─── Priority Order per Role ─────────────────────────────────────────────────
 
 PRIORITY_ORDER = {
-    "decorticator":  ["nvidia/deepseek-v4-pro", "nvidia/minimax-m2.5", "nvidia/glm-5.1"],
-    "fast_chat":     ["groq/kimi-k2", "groq/llama-4-scout", "nvidia/minimax-m2.5"],
-    "synthesizer":   ["groq/kimi-k2", "groq/llama-4-scout", "nvidia/minimax-m2.5", "nvidia/glm-5.1"],
+    "decorticator":  ["nvidia/deepseek-v4-pro", "nvidia/minimax-m2.7", "nvidia/glm-5.1"],
+    "fast_chat":     ["nvidia/kimi-k2.6", "groq/llama-4-scout", "nvidia/minimax-m2.7"],
+    "synthesizer":   ["nvidia/kimi-k2.6", "groq/llama-4-scout", "nvidia/minimax-m2.7", "nvidia/glm-5.1"],
     "verifier":      ["groq/gpt-oss-120b", "groq/llama-4-scout", "nvidia/qwen-3.5", "nvidia/glm-5.1"],
     "search_exec":   ["groq/llama-3.1-8b"],
     "self_eval":     ["groq/llama-3.1-8b", "groq/llama-4-scout", "nvidia/deepseek-v4-pro"],
     "plan_compare":  ["nvidia/glm-5.1"],
-    "formatter":     ["groq/kimi-k2"],
+    "formatter":     ["nvidia/kimi-k2.6"],
 }
 
 # ─── Domain-Matched Pairs ────────────────────────────────────────────────────
 
 BEST_PAIRS = {
     "math":    ("nvidia/deepseek-v4-pro", "nvidia/qwen-3.5"),
-    "code":    ("nvidia/minimax-m2.5",  "nvidia/glm-5.1"),
+    "code":    ("nvidia/minimax-m2.7",  "nvidia/glm-5.1"),
     "science": ("nvidia/qwen-3.5",      "nvidia/deepseek-v4-pro"),
     "cfd":     ("nvidia/deepseek-v4-pro", "nvidia/glm-5.1"),
-    "arduino": ("nvidia/minimax-m2.5",  "nvidia/glm-5.1"),
-    "web":     ("nvidia/minimax-m2.5",  "nvidia/qwen-3.5"),
-    "general": ("nvidia/deepseek-v4-pro", "nvidia/minimax-m2.5"),
+    "arduino": ("nvidia/minimax-m2.7",  "nvidia/glm-5.1"),
+    "web":     ("nvidia/minimax-m2.7",  "nvidia/qwen-3.5"),
+    "general": ("nvidia/deepseek-v4-pro", "nvidia/minimax-m2.7"),
 }
 
 # ─── Fallback Maps ───────────────────────────────────────────────────────────
@@ -94,17 +97,17 @@ BEST_PAIRS = {
 NVIDIA_FALLBACKS = {
     "nvidia/deepseek-v4-pro": "nvidia/glm-5.1",
     "nvidia/glm-5":         "nvidia/glm-5.1",
-    "nvidia/glm-5.1":       "nvidia/nemotron-super",
-    "nvidia/minimax-m2.5":  "nvidia/qwen-3.5",
+    "nvidia/glm-5.1":       "nvidia/kimi-k2.6",
+    "nvidia/minimax-m2.7":  "nvidia/qwen-3.5",
     "nvidia/qwen-3.5":      "nvidia/deepseek-v4-pro",
-    "nvidia/nemotron-super": "nvidia/glm-5.1",
+    "nvidia/kimi-k2.6":     "nvidia/deepseek-v4-pro",
+    "nvidia/nemotron-super": "nvidia/kimi-k2.6",
 }
 
 GROQ_FALLBACKS = {
     "groq/llama-3.1-8b":  "nvidia/deepseek-v4-pro",
     "groq/qwen3-32b":     "nvidia/deepseek-v4-pro",
-    "groq/gpt-oss-120b":  "nvidia/minimax-m2.5",
-    "groq/kimi-k2":       "nvidia/minimax-m2.5",
+    "groq/gpt-oss-120b":  "nvidia/minimax-m2.7",
     "groq/llama-3.3-70b": "nvidia/deepseek-v4-pro",
     "groq/llama-4-scout": "nvidia/qwen-3.5",
 }

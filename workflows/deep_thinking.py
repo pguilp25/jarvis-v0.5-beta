@@ -24,9 +24,9 @@ ATTEMPT_LOG_LIMIT = 8000
 ALL_NVIDIA = [
     "nvidia/deepseek-v4-pro",
     "nvidia/glm-5",
-    "nvidia/minimax-m2.5",
+    "nvidia/minimax-m2.7",
     "nvidia/qwen-3.5",
-    "nvidia/nemotron-super",
+    "nvidia/kimi-k2.6",
 ]
 
 # ─── Verification prompt — all 5 check if a claimed solution actually works ──

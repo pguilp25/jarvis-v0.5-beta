@@ -10,8 +10,9 @@ import asyncio
 import aiohttp
 from typing import Optional
 from config import NVIDIA_MODEL_IDS, NVIDIA_SLEEP_BETWEEN
-from core.cli import thinking
+from core.cli import thinking, warn
 from core.rate_limiter import nvidia_limiter
+from core.stream_guard import DegenerationDetector
 
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
@@ -144,6 +145,11 @@ async def call_nvidia_stream(
     # reasoning model that mentions "[STOP]" in its CoT would otherwise trigger
     # an early-stop while still thinking. Track visible content separately.
     visible_chunks: list[str] = []
+    # Degeneration / prompt-leak guard. Aborts the stream as soon as the
+    # model starts repeating or emits prompt-only scaffolding. Saves both
+    # tokens and the next round's context (degenerate output here gets
+    # echoed into YOUR WORK SO FAR otherwise).
+    degen_guard = DegenerationDetector()
     async with aiohttp.ClientSession() as session:
         async with session.post(
             NVIDIA_API_URL, json=payload, headers=headers,
@@ -156,7 +162,32 @@ async def call_nvidia_stream(
             buf = b""
             done = False
             in_thinking_block = False
-            async for raw in resp.content.iter_any():
+            # Per-chunk idle timeout. NVIDIA NIM is genuinely slow — the
+            # first token can take up to ~10 minutes on a complex prompt,
+            # reasoning or not. The aiohttp `total` timeout is 1 hour so
+            # it can't catch a dead connection; we need a between-chunk
+            # cap that's still longer than NIM's worst legitimate wait.
+            # 10 min: tighter than the 1-hour total, slack enough that a
+            # slow first token (thinking or pre-token queue) doesn't trip
+            # it. Earlier 90s/300s caps killed legitimate slow starts.
+            STREAM_IDLE_TIMEOUT = 600.0
+            while True:
+                try:
+                    raw = await asyncio.wait_for(
+                        resp.content.readany(), timeout=STREAM_IDLE_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    # Raise as a regular RuntimeError so retry.py treats it
+                    # as a normal recoverable error (bounded retries +
+                    # fallback). asyncio.TimeoutError would trigger the
+                    # infinite-retry timeout path in retry.py — wrong for
+                    # an idle stream that's likely a dead connection.
+                    raise RuntimeError(
+                        f"NVIDIA {api_model} stream idle "
+                        f"{STREAM_IDLE_TIMEOUT:.0f}s — server stalled"
+                    )
+                if not raw:
+                    break  # EOF
                 buf += raw
                 while b"\n" in buf:
                     line_bytes, buf = buf.split(b"\n", 1)
@@ -198,6 +229,18 @@ async def call_nvidia_stream(
                             thought_logger.write_chunk(model_id, delta)
                             if stop_check and ("]" in delta or "\n" in delta):
                                 if stop_check("".join(visible_chunks)):
+                                    done = True
+                                    break
+                            # Degeneration / prompt-leak guard — check on
+                            # newline-bearing deltas so we re-scan when a
+                            # line completes. Cheap when not tripped.
+                            if "\n" in delta:
+                                reason = degen_guard.check("".join(visible_chunks))
+                                if reason:
+                                    warn(
+                                        f"  [{model_id.split('/')[-1]}] stream "
+                                        f"aborted — {reason}"
+                                    )
                                     done = True
                                     break
                     except (ValueError, KeyError, IndexError):

@@ -18,8 +18,8 @@ answer the same question in parallel, then a verifier picks the best or synthesi
 them. Your answer will be compared against other models — be thorough and accurate.
 
 YOUR CAPABILITIES:
-- You can search the web mid-thought by writing [WEBSEARCH: query] on its own line.
-  The system will fetch results and feed them back to you. Use this for current info.
+- You can search the web mid-thought with [WEBSEARCH: query]. See the SIGNAL
+  PROTOCOL below for the full two-tag fire pattern; bare tool tags do not fire.
 - After your answer, write [CONTEXT_NOTES] followed by 1-3 bullet points about
   what was discussed (helps maintain conversation context).""",
 
@@ -29,7 +29,8 @@ nuanced questions. 3-5 AI models answer in parallel, then engage in a full debat
 to find the best answer. A majority vote selects the winner.
 
 YOUR CAPABILITIES:
-- You can search the web mid-thought: [WEBSEARCH: query]
+- You can search the web mid-thought with [WEBSEARCH: query]. The SIGNAL
+  PROTOCOL below describes the full two-tag fire pattern.
 - Your answer will be debated against other models — cover edge cases, show your
   reasoning, and be precise. Shallow answers will lose the debate.
 - After your answer, write [CONTEXT_NOTES] with topic summary.""",
@@ -71,7 +72,9 @@ YOUR TOOLS — use in this order, escalate only if you need more:
 - [CODE: path/to/file] — read actual source code (last resort)
 - [SEARCH: pattern] — ripgrep search across all files
 - [WEBSEARCH: query] — web search for API docs, libraries
-Write all tags you need, then write STOP on its own line.
+Wrap your tool tags in [tool use]...[/tool use]; fire them with the two-tag
+[STOP][CONFIRM_STOP] signal documented in SIGNAL PROTOCOL below. A bare [STOP]
+does nothing — both halves are required.
 
 All edits are sandboxed — original files are never touched until the user approves.""",
 

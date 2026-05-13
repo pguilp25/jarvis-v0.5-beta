@@ -13,32 +13,9 @@ from config import NVIDIA_SLEEP_BETWEEN
 
 
 DECORTICATOR_PROMPT = """You are the ROUTER for a multi-agent AI system called JARVIS.
-Your job: understand what the user wants and pick the right agent to handle it.
-
-Think through this step by step:
-
-STEP 1 — WHAT HAPPENED BEFORE?
-Read the LAST EXCHANGE and CONTEXT below. Understand the conversation flow.
-What was the user doing? What did JARVIS produce? Is the user continuing that
-activity or starting something new?
-
-STEP 2 — WHAT DOES THE USER WANT NOW?
-Interpret their message in context. If their message is vague or ambiguous,
-the conversation history tells you what they mean. A user who just got an image
-and says "make it better" wants a new image. A user who just got code changes
-and says "also handle errors" wants more code changes. Think about their goal.
-
-STEP 3 — WHICH AGENT SERVES THAT GOAL?
-Pick the agent whose capabilities match what the user is trying to accomplish.
-Don't match keywords — understand the intent.
-
-Query: {query}
-
-LAST EXCHANGE:
-{last_exchange}
-
-Full context:
-{context}
+Your job: read the user's latest message in the context of the conversation,
+figure out what they want, and pick the agent whose capabilities serve that
+goal. Don't match keywords — understand the intent.
 
 ═══════════════════════════════════════════════════════════════
 AGENTS — what each one DOES (pick the one that fits the user's goal):
@@ -75,23 +52,42 @@ AGENTS — what each one DOES (pick the one that fits the user's goal):
    execute a command on their system.
 
 ═══════════════════════════════════════════════════════════════
-KEY ROUTING PRINCIPLE:
+KEY ROUTING PRINCIPLE — CONTINUE THE PREVIOUS ACTIVITY:
 ═══════════════════════════════════════════════════════════════
-If the user is continuing a previous activity (follow-up to image generation,
-follow-up to code changes, follow-up to research), route to the SAME agent
-that handled it before — unless the user clearly changed topics.
+If the user is following up on a previous activity, route to the SAME agent
+that handled it before — unless they clearly changed topics.
 
-A user who received an image and says anything about changing, improving,
-or redoing it → image. Not chat.
-
-A user who received code changes and asks for more changes → code. Not chat.
-
-A user who got research results and wants more depth → research. Not chat.
+  • Received an image and says anything about changing/improving/redoing it
+    → image. Not chat.
+  • Received code changes and asks for more changes → code. Not chat.
+  • Got research results and wants more depth → research. Not chat.
 
 ═══════════════════════════════════════════════════════════════
-DOMAINS: "general", "math", "code", "cfd", "arduino", "science", "web"
-COMPLEXITY: 1-2 trivial, 3-4 simple, 5-6 moderate, 7-8 complex, 9-10 deep
+DOMAINS:    "general", "math", "code", "cfd", "arduino", "science", "web"
+COMPLEXITY: 1-2 trivial / 3-4 simple / 5-6 moderate / 7-8 complex / 9-10 deep
 ═══════════════════════════════════════════════════════════════
+
+──────────────────────────────────────────────────────────────
+HOW TO READ WHAT FOLLOWS:
+  • CONVERSATION CONTEXT = recent turns, for tracking the thread.
+  • LAST EXCHANGE = the immediate prior message — the user is most
+    likely referring to that.
+  • USER REQUEST = what to route NOW.
+──────────────────────────────────────────────────────────────
+
+CONVERSATION CONTEXT:
+{context}
+
+LAST EXCHANGE:
+{last_exchange}
+
+══════════════════════════════════════════════════════════════════════
+[USER REQUEST] — the human's actual message (this is what you route)
+══════════════════════════════════════════════════════════════════════
+{query}
+══════════════════════════════════════════════════════════════════════
+[END USER REQUEST]
+══════════════════════════════════════════════════════════════════════
 
 Respond with ONLY valid JSON, no markdown:
 {{

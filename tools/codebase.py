@@ -347,23 +347,38 @@ def search_code(pattern: str, root: str, max_results: int = MAX_SEARCH_RESULTS) 
 
 
 def _parse_rg_output(output: str, max_results: int) -> list[dict]:
-    """Parse ripgrep output into structured results."""
+    """Parse ripgrep output into structured results.
+
+    Ripgrep formats:
+      match line:    file:LINE:content
+      context line:  file-LINE-content
+
+    The previous parser used `(.+?)[:-](\\d+)[:-](.*)$` which allowed
+    EITHER separator on EITHER side of the line number. That mis-parses
+    file paths containing `-`: for `dir-name/file.py:42:content`, the
+    lazy `(.+?)` could split before the `-` between `dir` and `name`,
+    sending `name/file.py:42` into the line-number group and failing.
+    Backtracking eventually finds a correct split, but the same logic
+    accepts inconsistent forms like `file:LINE-content` (mixed match
+    and context separators) which can never occur in real rg output.
+
+    The strict form below requires the two separators on the SAME line
+    to match: `:LINE:` or `-LINE-`. Eliminates the cross-form ambiguity.
+    """
     results = []
-    current_file = ""
 
     for line in output.split("\n"):
         if not line.strip():
             continue
-        # rg format: file:line:content  or  file-line-content (context)
-        match = re.match(r'^(.+?)[:-](\d+)[:-](.*)$', line)
+        # Strict: file<sep>LINE<sep>content where both <sep> are the same char.
+        match = re.match(r'^(.+?)([-:])(\d+)\2(.*)$', line)
         if match and len(results) < max_results:
-            filepath, line_num, content = match.groups()
+            filepath, _sep, line_num, content = match.groups()
             results.append({
                 "file": filepath,
                 "line_num": int(line_num),
                 "line": content.strip(),
             })
-            current_file = filepath
 
     return results
 
@@ -586,15 +601,29 @@ def search_refs(name: str, root: str, max_results: int = 30) -> str:
 
         entry = f"  {rel}:{linenum}  {content}"
 
-        # Categorize based on line content
+        # Categorize based on line content. The prefixes below are followed
+        # by an identifier-boundary check (next char must not be a word char
+        # or `_`) so `def {name}_other` does NOT get classified as a
+        # definition of `name`.
         stripped = content.lstrip()
-        if any(stripped.startswith(kw) for kw in [
+        def_prefixes = [
             f"def {name}", f"class {name}", f"async def {name}",
             f"function {name}", f"const {name}", f"let {name}", f"var {name}",
             f"export function {name}", f"export const {name}",
             f"export default function {name}",
             f"fn {name}", f"pub fn {name}", f"struct {name}", f"enum {name}",
-        ]):
+        ]
+        is_definition = False
+        for kw in def_prefixes:
+            if stripped.startswith(kw):
+                next_char = stripped[len(kw):len(kw) + 1]
+                # Identifier ends here only if next char is NOT another
+                # identifier char. `def foo(` / `class Foo:` / `class Foo `
+                # all qualify; `def foo_bar(` does not.
+                if not (next_char.isalnum() or next_char == '_'):
+                    is_definition = True
+                    break
+        if is_definition:
             definitions.append(entry)
         elif "import" in stripped.lower() or "require" in stripped.lower():
             imports.append(entry)

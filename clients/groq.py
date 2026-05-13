@@ -6,10 +6,12 @@ Supports SSE streaming to thought_logger.
 
 import json as _json
 import os
+import asyncio
 import aiohttp
 from typing import Optional
 from config import GROQ_MODEL_IDS
-from core.cli import thinking
+from core.cli import thinking, warn
+from core.stream_guard import DegenerationDetector
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -115,6 +117,8 @@ async def call_groq_stream(
     # stop_check must only see VISIBLE content. If the model writes "[STOP]"
     # inside its CoT, the early-stop must NOT fire.
     visible_chunks: list[str] = []
+    # Same degeneration / prompt-leak guard as nvidia.py.
+    degen_guard = DegenerationDetector()
     async with aiohttp.ClientSession() as session:
         async with session.post(
             GROQ_API_URL, json=payload, headers=headers,
@@ -127,7 +131,23 @@ async def call_groq_stream(
             buf = b""
             done = False
             in_thinking_block = False
-            async for raw in resp.content.iter_any():
+            # Per-chunk idle timeout (see nvidia.py for full rationale).
+            # Groq is generally much faster than NVIDIA but a stuck stream
+            # would still waste the parent's 1-hour aiohttp budget without
+            # this guard. Matches the NVIDIA cap so behaviour is uniform.
+            STREAM_IDLE_TIMEOUT = 600.0
+            while True:
+                try:
+                    raw = await asyncio.wait_for(
+                        resp.content.readany(), timeout=STREAM_IDLE_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        f"Groq {api_model} stream idle "
+                        f"{STREAM_IDLE_TIMEOUT:.0f}s — server stalled"
+                    )
+                if not raw:
+                    break  # EOF
                 buf += raw
                 while b"\n" in buf:
                     line_bytes, buf = buf.split(b"\n", 1)
@@ -160,6 +180,16 @@ async def call_groq_stream(
                             thought_logger.write_chunk(model_id, delta)
                             if stop_check and ("]" in delta or "\n" in delta):
                                 if stop_check("".join(visible_chunks)):
+                                    done = True
+                                    break
+                            # Degeneration / prompt-leak guard.
+                            if "\n" in delta:
+                                reason = degen_guard.check("".join(visible_chunks))
+                                if reason:
+                                    warn(
+                                        f"  [{model_id.split('/')[-1]}] stream "
+                                        f"aborted — {reason}"
+                                    )
                                     done = True
                                     break
                     except (ValueError, KeyError, IndexError):

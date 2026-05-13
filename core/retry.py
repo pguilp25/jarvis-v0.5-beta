@@ -5,12 +5,32 @@ v5: connectivity check before API calls.
 Timeout policy:
   - Timeout errors: infinite retries with exponential backoff (10s, 20s, 40s … capped at 5min)
   - Other errors: up to max_retries, then fallback model
+  - PERMANENT errors (HTTP 410 Gone, 404 Not Found, 401/403 auth): skip
+    retries entirely, go straight to fallback. Retrying a deprecated
+    model just wastes 6+ seconds of backoff per call — observed in
+    practice when MiniMax 2.5 was sunset on NVIDIA NIM.
 """
 
+import re
 import asyncio
 from clients.api import call_api, call_api_stream
 from config import NVIDIA_FALLBACKS, GROQ_FALLBACKS, MODELS
 from core.cli import status, warn, error
+
+# Errors that CANNOT recover with a retry. Detected from the exception
+# message. We match on the literal HTTP status prefix the API clients
+# include, e.g. "HTTP 410:".
+_PERMANENT_STATUS = re.compile(r'HTTP\s*(?:410|404|401|403)\b', re.IGNORECASE)
+
+
+def _is_permanent_error(exc: BaseException) -> bool:
+    """True if `exc` represents a permanent failure that retries can't fix.
+
+    HTTP 410 (Gone) = model was deprecated/removed.
+    HTTP 404 = model name not recognised by the provider.
+    HTTP 401/403 = auth wrong — won't get better with a sleep.
+    """
+    return bool(_PERMANENT_STATUS.search(str(exc)))
 
 try:
     from tools.connectivity import is_online, wait_for_connection
@@ -89,6 +109,15 @@ async def call_with_retry(
             if "HTTP 400" in str(e):
                 warn(f"  {model_id}: Bad request — {last_error}")
                 break
+            # Don't retry on permanent failures (model deprecated, 410/404/
+            # 401/403). Retrying a sunset model just burns backoff seconds.
+            # Skip straight to fallback.
+            if _is_permanent_error(e):
+                warn(
+                    f"  {model_id}: permanent error ({last_error}) — "
+                    f"skipping retries, going to fallback"
+                )
+                break
             error_attempt += 1
             if error_attempt >= max_retries:
                 break
@@ -166,6 +195,12 @@ async def call_with_retry_stream(
             last_error = str(e)[:120]
             if "HTTP 400" in str(e):
                 warn(f"  {model_id}: Bad request — {last_error}")
+                break
+            if _is_permanent_error(e):
+                warn(
+                    f"  {model_id}: permanent error ({last_error}) — "
+                    f"skipping retries, going to fallback"
+                )
                 break
             error_attempt += 1
             if error_attempt >= max_retries:

@@ -90,9 +90,15 @@ def _build_ensemble_prompt(query: str, context: str, assumption: str, last_excha
     parts = [get_agent_context(agent_name), "", SYSTEM_KNOWLEDGE, ""]
 
     if context:
-        parts.append(f"CONVERSATION CONTEXT:\n{context}\n")
+        parts.append(
+            f"CONVERSATION CONTEXT (recent turns for tracking the thread):\n"
+            f"{context}\n"
+        )
     if last_exchange:
-        parts.append(f"LAST EXCHANGE (the user is most likely referring to this):\n{last_exchange}\n")
+        parts.append(
+            f"LAST EXCHANGE (the immediate prior message — the user is most\n"
+            f"likely referring to this):\n{last_exchange}\n"
+        )
     if assumption:
         parts.append(f"ANALYSIS REQUIREMENTS:\n{assumption}\n")
 
@@ -127,13 +133,18 @@ Then 1-3 short bullet points noting: what topic was discussed, any subject chang
 
     parts.append(instructions)
 
-    # User query goes LAST — clear delimiters so models can't miss it
+    # User query goes LAST — clear delimiters so models can't miss it.
+    # Uses the exact `USER REQUEST]` / `[END USER REQUEST]` block style
+    # SYSTEM_KNOWLEDGE tells the model to look for.
     parts.append(f"""
-════════════════════════════════════════
-USER QUERY (read this completely — including ALL numbered items, constraints, and rules):
-════════════════════════════════════════
+══════════════════════════════════════════════════════════════════════
+[USER REQUEST] — the human's actual task (this is what you must serve)
+══════════════════════════════════════════════════════════════════════
 {query}
-════════════════════════════════════════""")
+══════════════════════════════════════════════════════════════════════
+[END USER REQUEST] — read it completely, including ALL numbered items,
+constraints, and rules.
+══════════════════════════════════════════════════════════════════════""")
 
     return "\n".join(parts)
 
@@ -202,10 +213,9 @@ async def chat_fast(state: AgentState) -> AgentState:
 
     prompt = f"""You are JARVIS, a multi-brain AI assistant. Fast chat mode — be concise and direct.
 
-{ctx_str}User: {query}
-
 BEFORE answering:
-1. Does this message make sense ON ITS OWN, or does it need the conversation context above?
+1. Does the user's message below make sense ON ITS OWN, or does it need the
+   conversation context above?
    - "thanks", "ok", "cool" → standalone acknowledgment. Reply warmly.
    - Clear standalone questions → answer directly.
    - Words like "it", "that", "this", "more", "also", "what about", "explain",
@@ -217,7 +227,15 @@ BEFORE answering:
 
 AFTER your answer, on a NEW line write exactly:
 [CONTEXT_NOTES]
-Then 1-3 short bullet points noting: topic discussed, subject changes, key terms."""
+Then 1-3 short bullet points noting: topic discussed, subject changes, key terms.
+
+{ctx_str}══════════════════════════════════════════════════════════════════════
+[USER REQUEST] — the human's actual message (this is what you must serve)
+══════════════════════════════════════════════════════════════════════
+{query}
+══════════════════════════════════════════════════════════════════════
+[END USER REQUEST]
+══════════════════════════════════════════════════════════════════════"""
 
     # Step 1: answer
     answer = await call_with_retry("groq/llama-4-scout", prompt, max_tokens=16384)
@@ -273,7 +291,7 @@ async def chat_intelligent(state: AgentState) -> AgentState:
     answers = await _race_first_n(
         [
             ("groq/llama-4-scout", full_prompt),
-            ("nvidia/minimax-m2.5", full_prompt),
+            ("nvidia/minimax-m2.7", full_prompt),
             ("nvidia/qwen-3.5", full_prompt),
         ],
         n=2,
@@ -323,7 +341,7 @@ async def chat_intelligent(state: AgentState) -> AgentState:
             answers = await _race_first_n(
                 [
                     ("groq/llama-4-scout", augmented_prompt),
-                    ("nvidia/minimax-m2.5", augmented_prompt),
+                    ("nvidia/minimax-m2.7", augmented_prompt),
                     ("nvidia/qwen-3.5", augmented_prompt),
                 ],
                 n=2,

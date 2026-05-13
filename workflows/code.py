@@ -17,7 +17,8 @@ Workflow:
     Standard (complexity < 7):
       Layer 1: 4 AIs write independent plans (parallel)
       Layer 2: GLM-5.1 picks the best plan and improves it
-    Deep (complexity >= 7 or !!deepcode):
+    Deep (complexity >= 7 — the `!!deepcode` shell prefix forces complexity=9
+                          in main.py, which routes here through this branch):
       Layer 1: 4 AIs write independent plans (parallel)
       Layer 2: 4 AIs each pick the best plan, improve it (parallel)
       Layer 3: GLM-5.1 picks the best improved plan, improves it one final time
@@ -49,6 +50,7 @@ from core.tool_call import call_with_tools as _call_with_tools
 from core.state import AgentState
 from core.cli import step, status, success, warn, error
 from core.system_knowledge import SYSTEM_KNOWLEDGE
+from core import workflow_log as _wlog
 from clients.gemini import call_flash
 from tools.codebase import (
     scan_project, read_file, read_files, search_code,
@@ -63,7 +65,7 @@ from tools.sandbox import Sandbox
 UNDERSTAND_MODELS = [
     "nvidia/deepseek-v4-pro",
     "nvidia/qwen-3.5",
-    "nvidia/minimax-m2.5",
+    "nvidia/minimax-m2.7",
 ]
 
 IMPLEMENT_MODEL = "nvidia/glm-5.1"
@@ -71,15 +73,15 @@ IMPLEMENT_MODEL = "nvidia/glm-5.1"
 NVIDIA_5 = [
     "nvidia/deepseek-v4-pro",
     "nvidia/glm-5.1",
-    "nvidia/minimax-m2.5",
+    "nvidia/minimax-m2.7",
     "nvidia/qwen-3.5",
-    "nvidia/nemotron-super",
+    "nvidia/kimi-k2.6",
 ]
 
 NVIDIA_3 = [
     "nvidia/deepseek-v4-pro",
     "nvidia/qwen-3.5",
-    "nvidia/minimax-m2.5",
+    "nvidia/minimax-m2.7",
 ]
 
 
@@ -94,93 +96,75 @@ is written, you map the relevant code. Your output goes directly to the
 planners — the more precisely you map what exists, the better their plans.
 
 ══════════════════════════════════════════════════════════════════════
-USER REQUEST — the human's actual task (this is what you must serve)
+[USER REQUEST] — the human's actual task (this is what you must serve)
 ══════════════════════════════════════════════════════════════════════
 TASK: {task}
 ══════════════════════════════════════════════════════════════════════
-END OF USER REQUEST — everything below is JARVIS framing / facts / context
+[END USER REQUEST] — everything below is JARVIS framing / facts / context
 ══════════════════════════════════════════════════════════════════════
 
 PROJECT STRUCTURE:
 {project_structure}
 
 ══════════════════════════════════════════════════════════════════════
-THINK BEFORE ACTING — STREAMLINED, FLEXIBLE
+HOW TO WORK — preamble, then investigate, then map
 ══════════════════════════════════════════════════════════════════════
 
 You are upstream of every planner. A vague map produces vague plans;
 a precise map produces correct plans. Quality here multiplies through
 the whole pipeline. Slow down before any tool call.
 
-Before you call any tool, output:
+PREAMBLE — write this ONCE before your first tool call, in your own words:
 
-  ## 1. RESTATE THE GOAL IN YOUR OWN WORDS
+  ## 1. RESTATE THE GOAL
   Two sentences max. What does the user observably want to be true that
   isn't true now? Distinguish the SURFACE request ("add finding mode")
   from the UNDERLYING intent ("let me audit code without it being
   rewritten under me"). The intent matters more — plans pinned to the
-  surface miss what the user actually cares about.
+  surface miss what the user actually cares about. If the task references
+  conversation history ("fix that bug", "do the same for X"), use the
+  context to interpret it.
 
   ## 2. THE HARDEST UNKNOWN
-  In one sentence: what's the single technical fact whose answer most
-  changes the plan? Examples:
+  One sentence: the single technical fact whose answer most changes
+  the plan. Examples:
     "Does the current pipeline have a single entry point I can branch
-     before, or does the routing happen across three files?"
+     before, or does routing happen across three files?"
     "Is the merger model called via run_ensemble or directly?"
   This question drives your FIRST tool call. Everything else is secondary.
 
   ## 3. ASSUMPTIONS YOU'RE MAKING
-  List 2-3 things you currently BELIEVE without evidence. Mark each
-  one as something you'll verify with tools or leave as an open flag
-  for the planners.
+  List 2-3 things you currently BELIEVE without evidence. Mark each as
+  "will verify with tools" or "leave as open flag for the planners."
 
-After this preamble, do your investigation. Cite line numbers for
-every claim. If you don't have a line number, you're guessing — go
-read the file.
+THEN INVESTIGATE — before EVERY tool round, write a short OPEN QUESTIONS
+list. Each tool call must cite the Q it answers. If you can't name a
+question, you have no questions: write the map.
 
-══════════════════════════════════════════════════════════════════════
-YOUR PROCESS
-══════════════════════════════════════════════════════════════════════
+INVESTIGATION ORDER (escalate only if the cheaper tool was insufficient):
+  • [REFS: name]  — find a definition / its callers (CHEAP — prefer this)
+  • [CODE: path]  — read the file (use sparingly; large files cost tokens)
+  • [KEEP: path N-M] — after [CODE:], strip to the lines you actually need
+  • [SEARCH: pattern] — text search across the codebase
+  • [DETAIL: section] — pre-built code map for a subsystem
 
-Before EVERY tool round, write a short list of OPEN QUESTIONS — what
-you don't know yet that the next batch of tools will answer. If you
-can't name a specific question, you have no questions: write the map.
-Each tool call must cite the Q it answers.
+Start with names mentioned in the task, then follow the call chain.
+Batch your tool calls — one big batch beats five small rounds.
 
-1. RESTATE THE GOAL
-   What does the user want to observe when this is done?
-   Separate CONTEXT (what exists) from GOAL (what should change).
-   If the task references conversation history ("fix that bug",
-   "do the same for X"), use the context to understand what they mean.
+⚠ DO NOT re-read a file already in the CONTEXT MANIFEST. Reason from
+what you have. Re-reads are flagged with ⛔ and will break the loop.
 
-2. IDENTIFY THE RELEVANT CODE
-   What functions, classes, and files are involved? For each one:
-     [REFS: name] to find it (CHEAP — prefer this)
-     [CODE: path] to read it (EXPENSIVE on large files), then [KEEP:]
-                  if the file is >100 lines
+THEN MAP WHAT YOU FOUND — for each relevant function, write what you
+ACTUALLY SAW:
+  "function_name at file.py:LINE — takes (params), does [what],
+   returns [type], called by [callers]"
+If you cannot write this with line numbers, you haven't read carefully
+enough. Read more.
 
-   Start with names mentioned in the task, then follow the call chain.
-   Batch your tool calls — one big batch beats five small rounds.
-
-   ⚠ DO NOT re-read a file already in the CONTEXT MANIFEST. Reason from
-   what you have. Re-reads are flagged with ⛔ and will break the loop.
-
-3. MAP WHAT YOU FIND
-   For each relevant function, write what you ACTUALLY SAW:
-     "function_name at file.py:LINE — takes (params), does [what],
-      returns [type], called by [callers]"
-   If you cannot write this with line numbers, you haven't read
-   carefully enough. [CODE:] the file again.
-
-4. TRACE THE DATA FLOW
-   If the goal involves the user seeing something, trace the chain:
-     Where does the data originate? → How does it reach the user's screen?
-   Name the function/file at each step. Flag missing links.
-
-5. CHECK FOR EXISTING IMPLEMENTATIONS
-   Before assuming something needs to be built from scratch, search:
-     [SEARCH: related_term]
-   The feature may partially exist already.
+If the goal involves the user seeing something, TRACE THE DATA FLOW
+from origin to user's screen. Name the function/file at each step;
+flag missing links. Before assuming something needs to be built from
+scratch, [SEARCH: related_term] — the feature may partially exist.
 
 ══════════════════════════════════════════════════════════════════════
 TOOLS
@@ -275,6 +259,49 @@ When your plan is complete, end your response naturally. You write plans,
 not code — you never use [DONE].
 
 ══════════════════════════════════════════════════════════════════════
+WHAT YOU MUST PRODUCE — the target shape, in one screen
+══════════════════════════════════════════════════════════════════════
+A correct plan ends with these sections, IN THIS ORDER. Detailed rules
+for each are below; this is the silhouette so you keep the destination
+in mind while you investigate:
+
+  ## GOAL
+  [One sentence: what the user OBSERVES when this works.]
+
+  ## REQUIREMENTS
+  R1. ...  (MET / UNMET — every UNMET points to a STEP that satisfies it)
+  R2. ...
+
+  ## SHARED INTERFACES
+  - function_name(p: T) -> R   defined in a.py, called from b.py
+  - field_name: T              set in producer.py, read by consumer.py
+
+  ## IMPLEMENTATION STEPS
+  ### STEP 1: short imperative name
+  SATISFIES: R1, R2
+  DEPENDS ON: (none)
+  FILES: path/file.py (modify)
+  WHAT TO DO:
+    - ACTION 1 (line N, function X): plain-English description.
+      REASON: satisfies R1 because ...
+
+  ## EDGE CASES
+  Each edge-case requirement → which STEP handles it, how.
+
+  ## VERIFICATION
+  Walk the user's experience after all steps land. Must end at something
+  the user SEES.
+
+Three absolute rules — violating any rejects the plan:
+  ✗ NO CODE in step bodies. Plain English + file:line citations only.
+  ✗ NO tool tags after you start writing ## GOAL. Plan-writing is terminal.
+  ✗ NO re-reading a file already in CONTEXT MANIFEST.
+
+The rest of this prompt explains the THINKING that produces a plan of
+this shape: an open-thinking preamble, the 5 phases of analysis, and
+the hard format rules. Read it, but always know what you're heading for.
+
+══════════════════════════════════════════════════════════════════════
 OPEN THINKING — A CONTINUOUS, FLEXIBLE PROCESS
 ══════════════════════════════════════════════════════════════════════
 
@@ -287,19 +314,18 @@ the goal is correctness, not ceremony. Once you've used a move, its
 output stands — don't recompute it every round.
 
   ▸ ORIENT — once, when the task is fresh
-    Briefly note in your own words:
-      • REAL GOAL — surface vs intent. Plans that miss intent miss
-        the point. "Add finding mode" SURFACE = "list flaws"; INTENT
-        = "let me audit without my code being rewritten."
-      • HARDEST UNKNOWN — the one fact that most changes the plan.
-        That fact drives your first investigation, not all of them.
-      • A FEW APPROACHES — 2-3 SUBSTANTIVELY different paths, each
-        one sentence. Don't commit yet; just see the alternatives.
-      • PRE-MORTEM — imagine your plan implemented and the user says
-        "still doesn't work." Name the 2-3 most likely reasons.
-    Write these ONCE in your own form. They stand for the task.
-    You can revise them later if new evidence demands — but don't
-    restate them every round.
+    Do the ORIENT preamble defined in SYSTEM_KNOWLEDGE — REAL GOAL,
+    HARDEST UNKNOWN, A FEW APPROACHES, PRE-MORTEM — in your own words.
+    These planner-specific cues:
+      • REAL GOAL — "Add finding mode" SURFACE = "list flaws";
+        INTENT = "let me audit without my code being rewritten."
+      • HARDEST UNKNOWN — drives your FIRST investigation, not all of them.
+      • A FEW APPROACHES — 2-3 SUBSTANTIVELY different paths, one
+        sentence each. Don't commit yet; just see the alternatives.
+      • PRE-MORTEM — name 2-3 most likely reasons the user would say
+        "still doesn't work" after your plan ships.
+    Write ONCE. They stand for the task. Revise if evidence demands;
+    do not restate every round.
 
   ▸ BEFORE ANY LOOKUP — say what you're asking
     "[CODE: foo.py] — I need to confirm whether run_ensemble is the
@@ -432,20 +458,68 @@ add it to the list with a one-sentence justification — but you may
 do this AT MOST ONCE per investigation.
 
 ══════════════════════════════════════════════════════════════════════
-PLAN-WRITING IS TERMINAL
+PLAN-WRITING USES THE [PLAN] TOOL
 ══════════════════════════════════════════════════════════════════════
 
-Once you write any plan-format header — "## GOAL", "## REQUIREMENTS",
-"## IMPLEMENTATION STEPS", "### STEP 1", etc. — your response is FINAL.
-Do NOT write any more tool tags after that point. Tool tags inside
-your plan body fire anyway and trigger another round, where the system
-asks you to "continue" — and you'll waste tokens rewriting the plan.
+When you're ready to commit, write the plan with the === PLAN === tool.
+The plan is stored separately from your prose and shown back to you in
+[YOUR PLAN] every round, so you can refine it incrementally — keep
+investigating with [CODE:] / [REFS:] / [VIEW:] etc., then come back
+and refine the plan when you've learned something new.
+
+WRITE / REWRITE the full plan:
+  === PLAN ===
+  ## GOAL
+  The user will observe X when this is done.
+
+  ## REQUIREMENTS
+  R1. ...
+  R2. ...
+
+  ## IMPLEMENTATION STEPS
+  ### STEP 1: ...
+  ...
+
+  ## TEST CRITERIA
+  ...
+  === END PLAN ===
+
+SURGICALLY EDIT the existing plan (line numbers are shown in
+[YOUR PLAN]; use them):
+  === PLAN_EDIT ===
+  [REPLACE LINES 12-14]
+  R3. New requirement that replaces old R3.
+  [/REPLACE]
+  [INSERT AFTER LINE 27]
+  ### STEP 4: Newly-identified step
+  SATISFIES: R5
+  FILES: foo.py (modify)
+  ...
+  [/INSERT]
+  === END PLAN_EDIT ===
+
+You can have MANY PLAN_EDIT blocks per round. Edits are applied
+bottom-up so earlier line numbers stay valid.
+
+FINALIZE — when the plan is complete and ready to ship:
+  [PLAN DONE]
+  [CONFIRM_PLAN_DONE]
+
+This ends your work as planner; whatever is in [YOUR PLAN] becomes
+your final submission. Don't write [PLAN DONE] until the plan covers
+every requirement with a concrete step.
 
 Strict order:
   Investigation phase: OPEN QUESTIONS → [tool use] batches → [STOP]
   → results arrive → ...repeat as needed under budget...
-  Final phase: ## GOAL ... ## REQUIREMENTS ... ## IMPLEMENTATION STEPS
-  ... ## TEST CRITERIA → END.
+  Plan phase: write === PLAN === with the full plan body.
+  Refinement (optional): more tool calls + === PLAN_EDIT === to refine.
+  Finalize: [PLAN DONE] [CONFIRM_PLAN_DONE].
+
+LEGACY: if you write a plan in raw prose (## GOAL, ## REQUIREMENTS,
+etc. directly in your response) WITHOUT the === PLAN === wrapper, the
+runtime takes your last round's text as the plan. Works, but you lose
+incremental refinement. Prefer === PLAN ===.
 
 ALWAYS wrap tool calls in [tool use]...[/tool use]. Bare tags can still
 fire by legacy parsing, but wrapping is required for deliberate calls
@@ -790,24 +864,24 @@ ALLOWED:
 
 BAD step body (rejected):
   ```python
-  def phase_find(task, ...):
-      step("Phase 2: FIND ...")
-      tasks = [_call_with_tools(m, ...) for m in models]
+  def process_batch(items, ...):
+      log("processing ...")
+      tasks = [worker(it, ...) for it in items]
       ...
   ```
 
 GOOD step body (what the coder needs):
-  Define async def phase_find(task, context, project_root,
-  research_cache) in workflows/code.py, inserted after REFINEMENT_PROMPT
-  near line 3675. The function:
-    - Logs step "Phase 2: FIND (Layer 1 — parallel flaw discovery)"
-    - Runs each model in UNDERSTAND_MODELS[:3] in parallel via
-      asyncio.gather, passing FINDING_PROMPT to _call_with_tools
-    - Parses "FINDING:" lines from each result by splitting on "|"
-      (max 4 parts) into dicts with keys location, severity, category,
-      description; annotates each with source_model
-    - Returns (findings, research_cache) when ≥2 models produced
-      findings; else (None, research_cache) as a fallback signal
+  Define async def process_batch(items, context, options) in
+  module/path.py, inserted after the existing helper near line N. The
+  function:
+    - Logs a "starting batch" step before any work
+    - Runs each item through `worker(...)` in parallel via
+      asyncio.gather, passing the options dict through unchanged
+    - Parses each worker's "RESULT:" lines by splitting on "|" (max 4
+      parts) into dicts with the agreed-upon keys; annotates each with
+      the source worker name
+    - Returns (results, context) when ≥2 workers produced output; else
+      (None, context) as a fallback signal
 
 The good version is shorter AND more useful: the coder can implement
 the function correctly. The bad version locks the coder into your
@@ -1198,8 +1272,20 @@ Add #label to name results. [DISCARD: #label] to remove irrelevant ones.
   [REFS: name]       All definitions, imports, call sites
   [LSP: name]        Type info, inheritance
   [CODE: path]       Read the FULL file — NEVER add line numbers here.
-                     [CODE: path N-M] is FORBIDDEN. Read full, then KEEP.
-  [KEEP: path N-M]   After [CODE:], strip to the lines you need
+                     [CODE: path N-M] is FORBIDDEN. Read full, then KEEP/VIEW.
+                     On files too large to fit, [CODE:] returns a SKELETON
+                     ONLY (function/class names + line numbers). Follow up
+                     with [VIEW:] to read the actual content.
+  [VIEW: path LINE]  Read ~200 lines centered on LINE in a LARGE file (one
+                     that [CODE:] returned as SKELETON). Auto-extends to
+                     the enclosing def/class so you always see a complete
+                     unit. Use this for EXPLORATION — when you have a line
+                     number from the skeleton but don't yet know the file.
+                     REJECTED on small files (use [CODE:] there instead).
+  [VIEW: path N-M]   Same, but explicit range. Max 600 lines per call.
+  [KEEP: path N-M]   After [CODE:], strip to the lines you need (for
+                     surgical edits — line numbers preserve so [REPLACE
+                     LINES N-M] anchors correctly).
   [SEARCH: pattern]   Ripgrep text search (⚠ not edit syntax)
   [SEMANTIC: description] Vector embedding search — describe what you want in plain English,
                       returns the 10 most relevant purpose categories' code with ±10 line context
@@ -1208,16 +1294,17 @@ Add #label to name results. [DISCARD: #label] to remove irrelevant ones.
   [WEBSEARCH: query]  External docs
 
   REFS first → SEMANTIC if you don't know the exact name → CODE for details.
+  On a BIG file: [CODE:] returns a skeleton → pick a line → [VIEW: path lineN].
   Every claim about code must cite a line number from a tool result.
 
 ══════════════════════════════════════════════════════════════════════
 
 ══════════════════════════════════════════════════════════════════════
-USER REQUEST — the human's actual task (this is what you must serve)
+[USER REQUEST] — the human's actual task (this is what you must serve)
 ══════════════════════════════════════════════════════════════════════
 TASK: {task}
 ══════════════════════════════════════════════════════════════════════
-END OF USER REQUEST — everything below is JARVIS framing / facts / context
+[END USER REQUEST] — everything below is JARVIS framing / facts / context
 ══════════════════════════════════════════════════════════════════════
 
 PROJECT FILES (these exist on disk — use exact paths in every FILES: line):
@@ -1442,8 +1529,16 @@ leading spaces. The engine replaces i{{N}}| with N actual spaces.
 TOOLS
 ══════════════════════════════════════════════════════════════════════
 
-  [CODE: path #label]       Read a source file
-  [KEEP: path N-M #label]   Strip to kept line ranges (use on files >100 lines)
+  [CODE: path #label]       Read a source file. Returns FULL content for
+                            small files, SKELETON ONLY for files too large
+                            to fit. On a SKELETON, use [VIEW:] to read body.
+  [VIEW: path LINE #label]  Read ~200 lines centered on LINE — for LARGE
+                            files where [CODE:] returned a skeleton. Auto-
+                            extends to the enclosing def/class. Rejected on
+                            small files (use [CODE:] there).
+  [VIEW: path N-M #label]   Same but explicit range. Max 600 lines.
+  [KEEP: path N-M #label]   AFTER [CODE:] on a small/medium file, strip to
+                            the kept ranges for surgical edits.
   [REFS: name #label]       Find all definitions, imports, call sites
   [SEARCH: pattern #label]  Ripgrep text search (⚠ not edit syntax)
   [DISCARD: #label]         Remove a result from context
@@ -1766,6 +1861,28 @@ HARD RULES
   ✗ Never skip parts of the step
   ✗ Never change signatures the plan didn't authorize
 
+══════════════════════════════════════════════════════════════════════
+"NO CHANGES NEEDED" — STRICT MARKER (read carefully)
+══════════════════════════════════════════════════════════════════════
+
+If after investigating you determine that THIS STEP requires NO code
+changes (the requirement is already satisfied by existing code), you
+must signal that explicitly so the orchestrator stops retrying. Write
+this LITERAL line (free text before/after is fine):
+
+  STEP COMPLETE: NO CHANGES NEEDED
+
+Then [DONE][CONFIRM_DONE]. Fuzzy phrases like "code matches", "looks
+correct", "works as expected" no longer count — only the literal marker
+above triggers the no-op exit. This prevents the old false-positive
+where the model wrote "the existing code matches" while actually missing
+required edits, and the step was prematurely closed.
+
+⚠ Do NOT write this marker unless you have READ the file in this
+  response (see HARD RULES above) and walked through the requirement.
+  Writing it without evidence is the worst possible failure: the step
+  closes with no edits AND no investigation trace.
+
 
 ══════════════════════════════════════════════════════════════════════
 USER REQUEST — the step you must implement (derived from the human's task)
@@ -1778,7 +1895,7 @@ this safely; the step below is WHAT to do.
 {step_instructions}
 
 ══════════════════════════════════════════════════════════════════════
-END OF USER REQUEST — supporting facts JARVIS gives you follow
+[END USER REQUEST] — supporting facts JARVIS gives you follow
 ══════════════════════════════════════════════════════════════════════
 
 {shared_interfaces}
@@ -1791,24 +1908,35 @@ END OF USER REQUEST — supporting facts JARVIS gives you follow
 
 
 IMPROVE_PROMPT_TEMPLATE = """══════════════════════════════════════════════════════════════════════
-WHO YOU ARE — SYSTEM PROMPT FROM JARVIS
+[SYSTEM] — your role in the JARVIS pipeline (workflow, not user request)
 ══════════════════════════════════════════════════════════════════════
-The text from here until the "USER REQUEST" block below is JARVIS
-describing your role. It is NOT from the human user — it is the
-orchestrator's framing. The human's actual task appears later in
-a clearly marked USER REQUEST block.
+This block (until [USER REQUEST]) is JARVIS describing HOW you fit into
+the pipeline. The human did NOT write any of it — your loyalty is to
+the [USER REQUEST] further down; this just tells you how to serve it.
 
-You are a plan improver in JARVIS. You receive multiple plans for the
-same task. Your job has two parts:
+You are a plan improver (Layer 2 of the planning pipeline). You receive
+multiple plans for the same task — see [INPUT PLANS] below. Your job:
 
-  PART 1: Pick the best plan (the one most likely to achieve the goal)
-  PART 2: Improve it with thoughtful additions the user would appreciate
+  PART 1: PICK the best plan (the one most likely to achieve the goal)
+  PART 2: IMPROVE it with thoughtful additions the user would appreciate
 
 The plans below were written by 4 planners who ALREADY investigated the
 code. Trust their findings unless something looks obviously wrong. Your
 value is JUDGMENT (picking + improving), not re-investigation.
 
-When done, end your response naturally — no [DONE] (you have no edits).
+PRODUCING YOUR OUTPUT — use the PLAN tools (same as the planner):
+  • === PLAN === {body} === END PLAN ===    — write/rewrite your improved plan
+  • === PLAN_EDIT === [REPLACE LINES N-M]…[/REPLACE] === END PLAN_EDIT ===
+    [INSERT AFTER LINE N]…[/INSERT]          — surgically refine it
+  • [PLAN DONE][CONFIRM_PLAN_DONE]           — finalize and submit
+  • Your draft persists in [YOUR PLAN] across rounds, with line numbers.
+
+Recommended flow:
+  1. (Optional) ONE [tool use] batch to verify disputed claims, then [STOP].
+  2. Seed your improved plan: === PLAN === {pick the best input plan,
+     verbatim, then add your improvements inline} === END PLAN ===
+  3. Refine with === PLAN_EDIT === blocks if you need to tweak.
+  4. [PLAN DONE][CONFIRM_PLAN_DONE] when complete.
 
 ══════════════════════════════════════════════════════════════════════
 OPEN THINKING — A CONTINUOUS, FLEXIBLE PROCESS
@@ -1897,27 +2025,34 @@ THE RE-READ RULE: If a file appears in the CONTEXT MANIFEST, DO NOT
 manifest flags re-reads with ⛔ markers — heed them.
 
 ══════════════════════════════════════════════════════════════════════
-PLAN-WRITING IS TERMINAL
+PRODUCING THE IMPROVED PLAN — use the PLAN tools
 ══════════════════════════════════════════════════════════════════════
 
-The moment you write any of these headers, your response is FINAL:
-  • "## OPEN QUESTIONS" (allowed — that's part of investigation)
-  • "BEST: Plan #N"
-  • "## PART 1"  or  "PART 1 —"  or  "### Plan by"
-  • "## GOAL"  or  "## REQUIREMENTS"  or any other plan-format header
+Your improved plan lives in === PLAN === blocks — NOT in raw prose. The
+[YOUR PLAN] section will echo your draft (line-numbered) across rounds
+so you can refine it. Tool tags INSIDE === PLAN === / === PLAN_EDIT ===
+blocks are masked and don't fire — write [CODE: foo.py] inside the
+plan body without worrying about accidental execution.
 
-After those headers appear, you MUST NOT write any more tool tags.
-Tool tags inside your plan body will fire and trigger another round —
-the system will then ask you to "continue" and you'll waste tokens
-rewriting the plan. Don't.
+ORDER OF OPERATIONS:
+  1. (Optional) OPEN QUESTIONS → ONE [tool use] batch → [STOP][CONFIRM_STOP]
+     ONLY to resolve a SPECIFIC disagreement between plans. If you
+     can't write the question, skip this step.
+  2. Pick the best input plan. Write your improved version:
+       === PLAN ===
+       {best plan body with your improvements integrated}
+       === END PLAN ===
+  3. If you need to tweak a few lines after re-reading, refine in place:
+       === PLAN_EDIT ===
+       [REPLACE LINES 12-14]
+       refined content
+       [/REPLACE]
+       === END PLAN_EDIT ===
+  4. Finalize: [PLAN DONE][CONFIRM_PLAN_DONE].
 
-WRITE IN THIS ORDER:
-  Optional OPEN QUESTIONS list → optional one [tool use] batch + [STOP]
-  → wait for results → entire plan in one go → END.
-
-If a tool result reveals you need ONE more lookup, you may still issue
-it BEFORE writing any plan header. But once a header appears, the
-investigation phase is over forever.
+Plain prose like "BEST: Plan #N because ..." can still go in your
+response BEFORE the === PLAN === block — useful context for the merger.
+But the binding output is what's inside === PLAN ===.
 
 ══════════════════════════════════════════════════════════════════════
 NO CODE IN THE PLAN — ABSOLUTE
@@ -1941,30 +2076,30 @@ the exact location, and the precise description — NOT retyping code.
   • Plain-English description of what the new code does
 
 BAD (what kills plans):
-  ### STEP 3: Implement phase_find
+  ### STEP 3: Implement process_batch
   ```python
-  def phase_find(task, context, ...):
-      step("Phase 2: FIND ...")
+  def process_batch(items, context, ...):
+      log("starting batch ...")
       tasks = []
       ...60 lines of Python...
   ```
 
 GOOD (what coders need):
-  ### STEP 3: Implement phase_find in workflows/code.py
+  ### STEP 3: Implement process_batch in module/path.py
   SATISFIES: R3, R4
-  FILES: workflows/code.py (add after REFINEMENT_PROMPT, near line 3675)
+  FILES: module/path.py (add after the existing helper, near line N)
   WHAT TO DO:
-    Define an async function phase_find(task, context, complexity,
-    project_root, preloaded_research, research_cache) that:
-    - Logs step "Phase 2: FIND (Layer 1 — parallel flaw discovery)"
-    - Runs each model in UNDERSTAND_MODELS[:3] in parallel via
-      asyncio.gather, each calling _call_with_tools with FINDING_PROMPT
-    - Parses each result's "FINDING:" lines into dicts with keys
-      location, severity, category, description (split on "|", max 4 parts)
-    - Annotates each finding with source_model = model.split("/")[-1]
-    - Returns (findings_list, research_cache) when ≥2 models produced
-      findings, else returns (None, research_cache) as a fallback signal
-    RAISES: nothing — exceptions from a model become warn() + skip
+    Define an async function process_batch(items, context, options,
+    project_root, preloaded_state, shared_cache) that:
+    - Logs a "starting batch" step before any work
+    - Runs each item through `worker(...)` in parallel via
+      asyncio.gather, passing options through unchanged
+    - Parses each worker's "RESULT:" lines into dicts with the agreed
+      keys (split on "|", max 4 parts)
+    - Annotates each result with source_worker = worker_id.split("/")[-1]
+    - Returns (results_list, shared_cache) when ≥2 workers produced
+      output, else returns (None, shared_cache) as a fallback signal
+    RAISES: nothing — exceptions from a worker become warn() + skip
 
 A coder reading the GOOD version writes the function correctly without
 guessing. A coder reading the BAD version copies your Python verbatim
@@ -2055,46 +2190,82 @@ Produce a complete plan in standard format:
   - [addition]: passes GATE 1/2/3 because [reason]
 
 
-═══════════════════════════════════════════════════════════════════════
-CONTEXT
-═══════════════════════════════════════════════════════════════════════
-
 ══════════════════════════════════════════════════════════════════════
-USER REQUEST — the human's actual task (this is what you must serve)
+[USER REQUEST] — the human's actual task (this is what you must serve)
 ══════════════════════════════════════════════════════════════════════
 TASK: {task}
 ══════════════════════════════════════════════════════════════════════
-END OF USER REQUEST — everything below is JARVIS framing / facts / context
+[END USER REQUEST]
 ══════════════════════════════════════════════════════════════════════
 
-PROJECT:
 {context}
 
-PLANS TO EVALUATE:
+══════════════════════════════════════════════════════════════════════
+[INPUT PLANS] — the Layer-1 drafts you must improve from
+══════════════════════════════════════════════════════════════════════
+Each block below is one planner's full plan. Read them, pick the
+strongest, integrate the best ideas from the others, then output
+your improved version using === PLAN === / === PLAN_EDIT === tools.
+
 {all_plans_text}
+══════════════════════════════════════════════════════════════════════
+[END INPUT PLANS]
+══════════════════════════════════════════════════════════════════════
 
 {preloaded_research}
 """
 
 MERGE_PROMPT_TEMPLATE = """══════════════════════════════════════════════════════════════════════
-WHO YOU ARE — SYSTEM PROMPT FROM JARVIS
+[SYSTEM] — your role in the JARVIS pipeline (workflow, not user request)
 ══════════════════════════════════════════════════════════════════════
-The text from here until the "USER REQUEST" block below is JARVIS
-describing your role. It is NOT from the human user — it is the
-orchestrator's framing. The human's actual task appears later in
-a clearly marked USER REQUEST block.
+This block (until [USER REQUEST]) is JARVIS describing HOW you fit into
+the pipeline. The human did NOT write any of it — your loyalty is to
+the [USER REQUEST] further down; this just tells you how to serve it.
 
-You are the final plan merger in JARVIS. You receive {n_plans} plans
-for the same task. You pick ONE and produce THE final plan that the
-coder will implement. This is the last chance to catch plan errors.
+You are the FINAL plan merger (Layer 3 — last stop before code). You
+receive {n_plans} improved plans for the same task — see [INPUT PLANS]
+below — and you produce THE single plan the coder will implement. This
+is the last chance to catch plan errors.
 
-The plans below were written by 4 planners who ALREADY investigated the
-code with tools. Their findings (file paths, line numbers, function
-signatures) are inside the plans. You ARE NOT a re-investigator — you
-are a JUDGE. Read the plans carefully, decide what to trust, fix what's
-wrong. Tools are a backup, not your starting point.
+The improved plans below were written by Layer 1 planners + Layer 2
+improvers who ALREADY investigated the code with tools. Their findings
+(file paths, line numbers, function signatures) are inside the plans.
+You ARE NOT a re-investigator — you are a JUDGE. Tools are a backup
+for resolving DISAGREEMENTS, not your starting point.
 
-When done, end your response naturally — no [DONE] (you have no edits).
+PRODUCING THE FINAL PLAN — same PLAN tools as the planner:
+  • === PLAN === {body} === END PLAN ===    — write the final plan
+  • === PLAN_EDIT === [REPLACE LINES N-M]…[/REPLACE]
+    [INSERT AFTER LINE N]…[/INSERT]          — refine in place
+    === END PLAN_EDIT ===
+  • [PLAN DONE][CONFIRM_PLAN_DONE]           — finalize and submit
+  • Your draft persists in [YOUR PLAN] across rounds, with line numbers.
+
+The recommended merger workflow — you're "a planner that starts from
+N existing drafts instead of from scratch":
+
+  1. ORIENT briefly: which input plan is the best baseline? Where do
+     the plans DISAGREE on concrete code facts (signatures, line
+     numbers, file paths)? These are the spots that need verification.
+  2. (Optional) ONE [tool use] batch — ONLY to resolve a SPECIFIC
+     disagreement. Cite which Plan and which claim each call settles.
+     [STOP][CONFIRM_STOP].
+  3. SEED the merged plan with your chosen baseline:
+       === PLAN ===
+       {best baseline plan, verbatim, with any verified corrections}
+       === END PLAN ===
+  4. INTEGRATE improvements from the other input plans, line by line:
+       === PLAN_EDIT ===
+       [INSERT AFTER LINE 45]
+       ### STEP 4: handle edge case from Plan #C
+       SATISFIES: R5
+       FILES: ...
+       [/INSERT]
+       [REPLACE LINES 12-14]
+       R3. Tighter requirement from Plan #B
+       [/REPLACE]
+       === END PLAN_EDIT ===
+  5. When the plan is correct AND complete: [PLAN DONE][CONFIRM_PLAN_DONE].
 
 ══════════════════════════════════════════════════════════════════════
 OPEN THINKING — A CONTINUOUS, FLEXIBLE PROCESS
@@ -2193,22 +2364,32 @@ your first tool round), DO NOT [CODE:] or [KEEP:] it again. The manifest
 flags re-reads with ⛔ markers. Trust them.
 
 ══════════════════════════════════════════════════════════════════════
-PLAN-WRITING IS TERMINAL
+PRODUCING THE FINAL PLAN — use the PLAN tools
 ══════════════════════════════════════════════════════════════════════
 
-Once you write ANY of these headers, your response is FINAL and you
-MUST NOT issue more tool tags:
-  • "BEST: Plan #N"
-  • "## GOAL"  or  "## REQUIREMENTS"  or  "## IMPLEMENTATION STEPS"
-  • Any plan-format section header
+Your final plan lives in === PLAN === / === PLAN_EDIT === blocks — NOT
+in raw prose. [YOUR PLAN] echoes the current draft (line-numbered)
+across rounds so you can refine it. Tool tags INSIDE plan blocks are
+masked and don't fire — write [CODE: foo.py] inside the plan body
+without worrying about accidental execution.
 
-Write in this strict order:
-  Optional OPEN QUESTIONS list → optional ONE [tool use] batch + [STOP]
-  → wait for results → entire final plan in one response → END.
+ORDER OF OPERATIONS:
+  Investigation phase (optional, ≤1 round):
+    OPEN QUESTIONS → ONE [tool use] batch → [STOP][CONFIRM_STOP]
+    Use this ONLY for SPECIFIC disagreements among input plans.
+  Merge phase:
+    === PLAN === {seed with best input plan, integrated as much as you
+      can in one pass} === END PLAN ===
+  Refinement phase (optional):
+    === PLAN_EDIT === blocks to integrate further improvements from
+      other input plans, using line numbers from [YOUR PLAN].
+  Finalize:
+    [PLAN DONE][CONFIRM_PLAN_DONE]
 
-Tool tags AFTER a plan header fire anyway — the system runs them, then
-asks you to "continue", and you waste tokens rewriting the plan from
-scratch. Past mergers have lost 3+ rounds this way. Don't.
+You can mix investigation and refinement across rounds — call a tool
+to verify a claim, then a === PLAN_EDIT === to fix the plan based on
+what you learned. The plan persists; only finalize when correct AND
+complete.
 
 ══════════════════════════════════════════════════════════════════════
 NO CODE IN THE PLAN — ABSOLUTE
@@ -2222,38 +2403,38 @@ the actual file and writes the code. The plan must NEVER contain:
   ✗ Imports, decorators, multi-line string literals (verbatim prompts)
   ✗ Pseudo-code that LOOKS like real code
 
-  ✓ Backticked names: `phase_find`, `MODELS_DEEPCODE_LAYER1`
+  ✓ Backticked names: `process_batch`, `WORKER_POOL_SIZE`
   ✓ Single-line signatures in SHARED INTERFACES
   ✓ File:line citations: "modify aM() at index.html:414"
   ✓ Plain-English description of every change
 
 BAD plan step (REJECTED — too much code):
-  ### STEP 3: Implement phase_find
+  ### STEP 3: Implement process_batch
   ```python
-  def phase_find(task, context, ...):
-      step("...")
+  def process_batch(items, context, ...):
+      log("...")
       tasks = []
-      for model_id in models:
-          tasks.append(_call_with_tools(...))
+      for worker_id in workers:
+          tasks.append(worker(...))
       ...
   ```
 
 GOOD plan step (what the coder needs):
-  ### STEP 3: Implement phase_find in workflows/code.py
+  ### STEP 3: Implement process_batch in module/path.py
   SATISFIES: R3, R4
-  FILES: workflows/code.py (add after REFINEMENT_PROMPT, near line 3675)
+  FILES: module/path.py (add after the existing helper, near line N)
   WHAT TO DO:
-    Define async def phase_find(task, context, complexity, project_root,
-    preloaded_research, research_cache):
-    - Log step "Phase 2: FIND (Layer 1 — parallel flaw discovery)"
-    - asyncio.gather over UNDERSTAND_MODELS[:3], each calling
-      _call_with_tools with FINDING_PROMPT
-    - For each result, split "FINDING:" lines on "|" (max 4 parts) into
-      dicts with keys location/severity/category/description; tag each
-      with source_model = model_id.split("/")[-1]
-    - Return (findings, research_cache) when ≥ 2 models produced
-      findings; else return (None, research_cache) as a fallback signal
-    - Exceptions from individual models become warn() + skip
+    Define async def process_batch(items, context, options, project_root,
+    preloaded_state, shared_cache):
+    - Log a "starting batch" step before any work
+    - asyncio.gather over the worker pool, each calling `worker(...)`
+      with the agreed-upon prompt template
+    - For each result, split "RESULT:" lines on "|" (max 4 parts) into
+      dicts with the agreed keys; tag each with
+      source_worker = worker_id.split("/")[-1]
+    - Return (results, shared_cache) when ≥ 2 workers produced output;
+      else return (None, shared_cache) as a fallback signal
+    - Exceptions from individual workers become warn() + skip
 
 Plans containing code blocks will be REJECTED and the planner above
 them will win by default. Compress the code out.
@@ -2400,25 +2581,31 @@ Rate the final plan 1-10 with one sentence each:
 If any rating < 6, the plan is not done. Improve before stopping.
 
 
-═══════════════════════════════════════════════════════════════════════
-CONTEXT
-═══════════════════════════════════════════════════════════════════════
-
 ══════════════════════════════════════════════════════════════════════
-USER REQUEST — the human's actual task (this is what you must serve)
+[USER REQUEST] — the human's actual task (this is what you must serve)
 ══════════════════════════════════════════════════════════════════════
 TASK: {task}
 ══════════════════════════════════════════════════════════════════════
-END OF USER REQUEST — everything below is JARVIS framing / facts / context
+[END USER REQUEST]
 ══════════════════════════════════════════════════════════════════════
 
-PROJECT:
 {context}
 
 {verify_block}
 
-PLANS:
+══════════════════════════════════════════════════════════════════════
+[INPUT PLANS] — {n_plans} improved plans from Layer 2 you must merge
+══════════════════════════════════════════════════════════════════════
+Each block below is one improver's final plan. Pick the best as your
+baseline (=== PLAN === to seed [YOUR PLAN]), then integrate the
+strongest ideas from the others (=== PLAN_EDIT ===). Resolve any
+disagreements via targeted tool calls only — these planners ALREADY
+investigated; trust their findings unless you can prove otherwise.
+
 {all_plans_text}
+══════════════════════════════════════════════════════════════════════
+[END INPUT PLANS]
+══════════════════════════════════════════════════════════════════════
 
 {preloaded_research}
 """
@@ -2562,8 +2749,12 @@ Edits: same i{{N}}| prefix, no trailing line number.
 TOOLS
 ══════════════════════════════════════════════════════════════════════
 
-  [CODE: path #label]       Read source file
-  [KEEP: path N-M #label]   Strip to kept ranges
+  [CODE: path #label]       Read source file (skeleton if too large)
+  [VIEW: path LINE #label]  Read ~200 lines centered on LINE in a large
+                            file. Auto-extends to enclosing def/class.
+                            Use after [CODE:] returns a skeleton.
+  [VIEW: path N-M #label]   Same, explicit range. Max 600 lines.
+  [KEEP: path N-M #label]   Strip to kept ranges (small/medium files)
   [REFS: name #label]       Definitions, imports, call sites
   [SEARCH: pattern #label]  Ripgrep text search (⚠ NOT edit syntax)
 
@@ -2728,11 +2919,11 @@ CONTEXT
 ═══════════════════════════════════════════════════════════════════════
 
 ══════════════════════════════════════════════════════════════════════
-USER REQUEST — the human's actual task (this is what you must serve)
+[USER REQUEST] — the human's actual task (this is what you must serve)
 ══════════════════════════════════════════════════════════════════════
 TASK: {task}
 ══════════════════════════════════════════════════════════════════════
-END OF USER REQUEST — everything below is JARVIS framing / facts / context
+[END USER REQUEST] — everything below is JARVIS framing / facts / context
 ══════════════════════════════════════════════════════════════════════
 
 PLAN: {plan}
@@ -2746,11 +2937,11 @@ PROJECT: {context}
 SUMMARY_PROMPT = """You implemented changes to achieve a goal. Summarize for the user.
 
 ══════════════════════════════════════════════════════════════════════
-USER REQUEST — the human's actual task (this is what you must serve)
+[USER REQUEST] — the human's actual task (this is what you must serve)
 ══════════════════════════════════════════════════════════════════════
 TASK: {task}
 ══════════════════════════════════════════════════════════════════════
-END OF USER REQUEST — everything below is JARVIS framing / facts / context
+[END USER REQUEST] — everything below is JARVIS framing / facts / context
 ══════════════════════════════════════════════════════════════════════
 
 FILES CHANGED:
@@ -2773,11 +2964,11 @@ MAP_UPDATE_PROMPT = """You implemented code changes. Update the project's code m
 DO NOT rewrite the maps. Output ONLY edit blocks for the parts that changed.
 
 ══════════════════════════════════════════════════════════════════════
-USER REQUEST — the human's actual task (this is what you must serve)
+[USER REQUEST] — the human's actual task (this is what you must serve)
 ══════════════════════════════════════════════════════════════════════
 TASK: {task}
 ══════════════════════════════════════════════════════════════════════
-END OF USER REQUEST — everything below is JARVIS framing / facts / context
+[END USER REQUEST] — everything below is JARVIS framing / facts / context
 ══════════════════════════════════════════════════════════════════════
 
 FILES CHANGED:
@@ -2835,20 +3026,38 @@ def _apply_map_edits(original_map: str, response_text: str) -> str:
         if not find_text:
             continue
         if find_text in result:
+            # Refuse to apply if the exact match is ambiguous — silently
+            # clobbering the first occurrence used to corrupt the map when
+            # a section heading appeared more than once.
+            if result.count(find_text) > 1:
+                warn(
+                    f"    Skipping ambiguous map edit — SEARCH matches "
+                    f"{result.count(find_text)} locations"
+                )
+                continue
             result = result.replace(find_text, replace_text, 1)
         else:
-            # Fuzzy: whitespace-normalized line match
+            # Fuzzy: whitespace-normalized line match. Collect ALL matches
+            # so we can detect ambiguity and refuse to clobber.
             find_lines = [l.strip() for l in find_text.split('\n')]
             result_lines = result.split('\n')
+            matches = []
             for i in range(len(result_lines) - len(find_lines) + 1):
                 window = [result_lines[i + j].strip() for j in range(len(find_lines))]
                 if window == find_lines:
-                    if replace_text:
-                        result_lines[i:i + len(find_lines)] = replace_text.split('\n')
-                    else:
-                        del result_lines[i:i + len(find_lines)]
-                    result = '\n'.join(result_lines)
-                    break
+                    matches.append(i)
+            if len(matches) == 1:
+                i = matches[0]
+                if replace_text:
+                    result_lines[i:i + len(find_lines)] = replace_text.split('\n')
+                else:
+                    del result_lines[i:i + len(find_lines)]
+                result = '\n'.join(result_lines)
+            elif len(matches) > 1:
+                warn(
+                    f"    Skipping ambiguous fuzzy map edit — "
+                    f"{len(matches)} locations match (normalized)"
+                )
 
     # Find ADD_SECTION blocks — append to end
     add_pattern = re.compile(r'\[ADD_SECTION\](.*?)\[/ADD_SECTION\]', re.DOTALL)
@@ -2925,13 +3134,23 @@ def _format_research_cache(research_cache: dict | None, max_chars: int = 30000) 
 
 
 def _parse_keep_ranges(text: str, filepath: str) -> list[tuple[int, int]]:
-    """Parse KEEP line ranges from model output. Returns sorted, merged ranges.
+    """Parse KEEP line ranges from model output. Returns sorted ranges.
 
     Accepts all of these forms (multiple ranges comma- or space-separated):
       [KEEP: path 50-80, 120-150]   →  [(50,80), (120,150)]
       [KEEP: path 50-80 120-150]    →  [(50,80), (120,150)]
       KEEP path 50-80, 120-150      →  [(50,80), (120,150)]
       50-80, 120-150                →  [(50,80), (120,150)]  (bare ranges)
+
+    OVERLAP HANDLING: ranges that overlap (e.g. 50-80 and 75-100) ARE merged
+    because keeping them separate would emit duplicate file lines. ADJACENT
+    ranges (e.g. 50-80 and 81-100) are also merged because the gap is zero.
+    BUT ranges with a gap (e.g. 50-80 and 85-100, 4-line gap) are NOT merged
+    anymore — the model asked for two distinct windows, the runtime delivers
+    two distinct windows. The previous +4 tolerance silently expanded the
+    request, which then surprised the model when `_filter_by_ranges` returned
+    code the model never asked to see and `_auto_rag` chased identifiers
+    from lines outside the request.
     """
     ranges = []
     # Universal: find ALL N-M patterns anywhere in text (covers every format).
@@ -2948,12 +3167,12 @@ def _parse_keep_ranges(text: str, filepath: str) -> list[tuple[int, int]]:
     if not ranges:
         return []
 
-    # Sort and merge overlapping ranges (with 3-line gap tolerance)
+    # Sort and merge ONLY truly overlapping/adjacent ranges (gap ≤ 0).
     ranges.sort()
     merged = [ranges[0]]
     for start, end in ranges[1:]:
         prev_start, prev_end = merged[-1]
-        if start <= prev_end + 4:  # merge if within 3 lines
+        if start <= prev_end + 1:  # overlap or adjacent — merge
             merged[-1] = (prev_start, max(prev_end, end))
         else:
             merged.append((start, end))
@@ -3008,13 +3227,15 @@ def _filter_by_ranges(content: str, ranges: list[tuple[int, int]], filepath: str
     lines = content.split('\n')
     total = len(lines)
 
-    # Extend ranges to scope anchors, then re-sort and re-merge
+    # Extend ranges to scope anchors, then re-sort and re-merge.
+    # Use the same gap≤0 merge rule as _parse_keep_ranges so the runtime
+    # only collapses ranges that would otherwise emit duplicate file lines.
     ranges = _extend_ranges_to_scope_anchor(ranges, lines)
     ranges.sort()
     merged = [ranges[0]]
     for s, e in ranges[1:]:
         ps, pe = merged[-1]
-        if s <= pe + 4:
+        if s <= pe + 1:
             merged[-1] = (ps, max(pe, e))
         else:
             merged.append((s, e))
@@ -3283,6 +3504,7 @@ def _check_syntax(filepath: str, content: str) -> tuple[bool, str]:
     elif ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
         # Use Node.js --check for JS/TS syntax validation
         import tempfile
+        tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=ext, delete=False, encoding="utf-8"
@@ -3311,10 +3533,12 @@ def _check_syntax(filepath: str, content: str) -> tuple[bool, str]:
         except Exception:
             return True, ""
         finally:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+            # Guard against tempfile creation failing before tmp_path is set.
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     elif ext in (".json",):
         import json
@@ -3355,15 +3579,41 @@ def _extract_code_blocks(response: str) -> dict:
     """
     result = {"edits": {}, "text_edits": {}, "new_files": {}, "reverts": []}
 
+    # ── Pre-compute "consumed" spans (inside === FILE: or === EDIT: bodies) ─
+    # REVERT directives, orphan line-edits, and any other top-level extraction
+    # must skip text that lives inside an edit/new-file body — those are file
+    # CONTENT, not directives. Without this, a new file whose body contains
+    # the literal string `[REVERT FILE: foo]` (e.g. JARVIS source rewriting
+    # its own prompts) triggers a spurious revert on `foo`.
+    _early_consumed_spans: list[tuple[int, int]] = []
+    for m in re.finditer(
+        r'===\s*EDIT:\s*(\S+).*?(?:\[/REPLACE\]|\[/INSERT\]|===\s*END\s+FILE\s*===)',
+        response, re.DOTALL,
+    ):
+        _early_consumed_spans.append(m.span())
+    for m in re.finditer(
+        r'===\s*FILE:\s*(\S+).*?===\s*END\s+FILE\s*===',
+        response, re.DOTALL,
+    ):
+        _early_consumed_spans.append(m.span())
+
+    def _early_in_consumed(pos: int) -> bool:
+        return any(s <= pos < e for s, e in _early_consumed_spans)
+
     # ── Extract REVERT directives ─────────────────────────────────────────
     # Single-line directive: `[REVERT FILE: path]` — restores filepath to its
     # state immediately before the most recent edit applied to it in this
     # session. The model can use this mid-response if it realizes its edits
     # are wrong, then write fresh edits in the same response.
+    #
+    # Skip occurrences inside `=== FILE: ===` and `=== EDIT: ===` bodies —
+    # those are file CONTENT, not directives.
     for revert_match in re.finditer(
         r'\[REVERT\s+FILE:\s*([^\]\n]+?)\s*\]',
         response
     ):
+        if _early_in_consumed(revert_match.start()):
+            continue
         rpath = revert_match.group(1).strip()
         if rpath:
             result["reverts"].append(rpath)
@@ -3515,6 +3765,18 @@ def _extract_code_blocks(response: str) -> dict:
         response, re.DOTALL,
     ):
         consumed_spans.append(edit_match.span())
+    # Also exclude `=== FILE: path === ... === END FILE ===` regions — any
+    # `[REPLACE LINES]`-shaped text inside a new-file body is literal content
+    # being written, not an orphan edit. Without this, a new file whose body
+    # contains the verbatim string `[REPLACE LINES N-M]` (e.g. JARVIS source
+    # itself) gets a spurious orphan edit grafted onto the most recent
+    # unrelated file in scope.
+    for file_match in re.finditer(
+        r'===\s*FILE:\s*(\S+).*?\n(?:.*?)'
+        r'(?:===\s*END\s+FILE\s*===|(?====\s*(?:EDIT|FILE):)|$)',
+        response, re.DOTALL,
+    ):
+        consumed_spans.append(file_match.span())
 
     def _in_consumed(pos: int) -> bool:
         return any(s <= pos < e for s, e in consumed_spans)
@@ -3757,15 +4019,41 @@ def _apply_line_edits(
     # than 50% (lines or bytes), the edits almost certainly target the
     # wrong ranges (off-by-N, plan referenced wrong file, etc.). Surface
     # and refuse — same protection the text-edit path already has.
+    def _projected_new_line_count(code: str) -> int:
+        """Count how many file-lines `code` will produce once applied.
+
+        `code` is the RAW model output for a REPLACE/INSERT body — it may
+        still carry `i{N}|` indent prefixes, `---` INSERT-AFTER separators,
+        etc. Those constructs are 1:1 with file lines (no prefix splits
+        across lines, no separator emits empty lines that survive), so a
+        raw-line count is the same as the post-restore line count.
+
+        Strips leading/trailing terminator newlines so 'abc\\n' counts as
+        1 line, not 2 — without this, a single-line REPLACE that includes
+        a trailing newline inflated projections and triggered false-positive
+        catastrophic-shrink rejections on legitimate edits.
+
+        INSERT-AFTER bodies with `---` anchor separators: only the lines
+        AFTER the `---` end up in the file. Strip the anchor portion before
+        counting so the projection reflects the actual growth.
+        """
+        if not code.strip():
+            return 0
+        sep_match = re.search(r'^[ \t]*---[ \t]*$', code, re.MULTILINE)
+        if sep_match:
+            code = code[sep_match.end():]
+        if not code.strip():
+            return 0
+        return len(code.strip('\n').split('\n'))
+
     if original_line_count >= 50 and edits:
         projected_lines = original_line_count
         for s, e, code in edits:
+            new_n = _projected_new_line_count(code)
             if s == 0:  # INSERT AFTER — grows
-                added = len(code.split('\n')) if code.strip() else 0
-                projected_lines += added
+                projected_lines += new_n
             else:
                 old_n = e - s + 1
-                new_n = len(code.split('\n')) if code.strip() else 0
                 projected_lines += (new_n - old_n)
         if projected_lines < original_line_count * 0.5:
             msg = (
@@ -3781,21 +4069,29 @@ def _apply_line_edits(
     # Sort edits by start (or end for inserts) DESCENDING — apply bottom to top
     # so each application can use the ORIGINAL line numbers without re-mapping.
     #
-    # Tiebreaker: ORIGINAL document order DESCENDING, so two INSERT AFTER at
-    # the same anchor are applied in reverse-write order. That way the model's
-    # writing order is preserved in the final file:
+    # Tiebreakers (in order):
+    #   1. ANCHOR position descending (bottom-to-top apply order).
+    #   2. KIND — when an INSERT AFTER and a REPLACE LINES share the same
+    #      anchor line, the REPLACE goes FIRST (i.e. sorts AFTER the INSERT
+    #      in the reverse-sorted list so it pops first). Otherwise the
+    #      INSERT could land inside a span the REPLACE then overwrites,
+    #      silently dropping the inserted lines.
+    #   3. ORIGINAL document order DESCENDING, so two INSERT AFTER at the
+    #      same anchor are applied in reverse-write order. The model's
+    #      writing order is preserved in the final file:
     #
-    #   [INSERT AFTER LINE 5] A     ← written first
-    #   [INSERT AFTER LINE 5] B     ← written second
+    #        [INSERT AFTER LINE 5] A     ← written first
+    #        [INSERT AFTER LINE 5] B     ← written second
     #
-    # We apply B first (lines[5:5] = [B]) then A (lines[5:5] = [A]) → final
-    # order is …,5, A, B, 6,… — matching the model's intent. Without the
-    # docindex tiebreaker, stable-sort preserved write order, so A applied
-    # first and B ended up BEFORE A in the file (silent reordering bug).
+    #      Apply B first (lines[5:5] = [B]) then A (lines[5:5] = [A]) →
+    #      final order is …,5, A, B, 6,… — matching the model's intent.
     def sort_key(e_pair):
         idx, (s, end, _) = e_pair
         anchor = end if s == 0 else s
-        return (anchor, idx)
+        # kind_rank: 0 = INSERT, 1 = REPLACE. With reverse=True the larger
+        # rank pops first → REPLACE applies before INSERT at the same anchor.
+        kind_rank = 0 if s == 0 else 1
+        return (anchor, kind_rank, idx)
     sorted_edits = [e for _, e in sorted(enumerate(edits), key=sort_key, reverse=True)]
 
     # Detect whether content uses the new i{N}| prefix format
@@ -4742,6 +5038,8 @@ async def phase_plan(task: str, context: str, complexity: int, project_root: str
     extended = complexity >= 7
     mode_label = "EXTENDED 3-layer" if extended else "STANDARD"
     step(f"=== Phase 2: PLAN [{mode_label}] ===")
+    _wlog.phase_start("plan", mode_label, complexity=complexity,
+                      task_chars=len(task), is_new_project=is_new_project)
 
     # Shared research cache — accumulates lookups across all AIs.
     # The planner uses [CODE:] to read files and [KEEP:] to strip irrelevant
@@ -4751,8 +5049,8 @@ async def phase_plan(task: str, context: str, complexity: int, project_root: str
     PLAN_MODELS = [
         "nvidia/deepseek-v4-pro",
         "nvidia/qwen-3.5",
-        "nvidia/minimax-m2.5",
-        "nvidia/nemotron-super",
+        "nvidia/minimax-m2.7",
+        "nvidia/kimi-k2.6",
     ]
 
     cot = PLAN_COT_NEW if is_new_project else PLAN_COT_EXISTING
@@ -4774,6 +5072,7 @@ async def phase_plan(task: str, context: str, complexity: int, project_root: str
 
     # == Layer 1: 4 AIs RACE — keep first 3, kill the last ==
     step(f"Layer 1: {len(PLAN_MODELS)} models racing (first 3 win)...")
+    _wlog.phase_event("Layer 1 start", models=",".join(m.split("/")[-1] for m in PLAN_MODELS))
 
     plan_tasks = [
         asyncio.create_task(_call_with_tools(
@@ -4822,17 +5121,45 @@ async def phase_plan(task: str, context: str, complexity: int, project_root: str
             r = t.result()
             if isinstance(r, dict) and r.get("answer"):
                 plans.append(r)
-        except Exception:
-            pass
+                _wlog.phase_event(
+                    "Layer 1 plan complete",
+                    model=r["model"].split("/")[-1],
+                    chars=len(r["answer"]),
+                    done=bool(r.get("done")),
+                )
+            else:
+                _wlog.phase_warn(
+                    "Layer 1 plan EMPTY",
+                    model=(r.get("model") if isinstance(r, dict) else "?"),
+                )
+        except Exception as ex:
+            _wlog.phase_error("Layer 1 plan raised", error=str(ex)[:200])
+
+    # Snapshot every collected plan to its own file under plans/
+    for i, p in enumerate(plans):
+        _wlog.save_plan(layer=1, index=i, model_id=p["model"], content=p["answer"])
 
     if not plans:
+        _wlog.phase_error("Layer 1 produced zero plans")
         raise RuntimeError("All models failed in planning")
 
     status(f"Layer 1: got {len(plans)} winning plans (research_cache: {len(research_cache)} entries)")
+    _wlog.phase_event(
+        "Layer 1 done",
+        n_plans=len(plans),
+        research_cache_entries=len(research_cache),
+    )
 
+    # Each plan gets a clearly-labelled [INPUT PLAN #N] block so the
+    # improver can refer to them by number ("Plan #2 is the best
+    # baseline; pull STEP 4 from Plan #3"). Matches the unified labelled-
+    # section vocabulary used elsewhere in the prompts.
     all_plans_text = "\n\n".join(
-        f"=== PLAN BY {p['model'].split('/')[-1].upper()} ===\n{p['answer']}"
-        for p in plans
+        f"──────────────────────────────────────────────────────────────────────\n"
+        f"[INPUT PLAN #{i + 1}] — by {p['model'].split('/')[-1]}\n"
+        f"──────────────────────────────────────────────────────────────────────\n"
+        f"{p['answer']}"
+        for i, p in enumerate(plans)
     )
 
     if extended:
@@ -4843,20 +5170,10 @@ async def phase_plan(task: str, context: str, complexity: int, project_root: str
         preloaded_research = _format_research_cache(research_cache)
 
         improve_prompt = SYSTEM_KNOWLEDGE + IMPROVE_PROMPT_TEMPLATE.format(
-
-
             task=task,
-
-
             context=context[:15000],
-
-
             all_plans_text=all_plans_text,
-
-
-            preloaded_research=preloaded_research
-
-
+            preloaded_research=preloaded_research,
         )
         # Use same 4 diverse models for Layer 2 debate as Layer 1 planning
         # to ensure consistent capability levels throughout the planning pipeline
@@ -4872,16 +5189,46 @@ async def phase_plan(task: str, context: str, complexity: int, project_root: str
         ))
         improved = [d for d in improved_results if isinstance(d, dict) and d.get("answer")]
 
+        # Log every improver outcome — including the ones that raised so a
+        # bug-hunt can tell "model never returned" apart from "model
+        # returned empty answer."
+        for raw in improved_results:
+            if isinstance(raw, dict) and raw.get("answer"):
+                _wlog.phase_event(
+                    "Layer 2 improver complete",
+                    model=raw["model"].split("/")[-1],
+                    chars=len(raw["answer"]),
+                    done=bool(raw.get("done")),
+                )
+            elif isinstance(raw, dict):
+                _wlog.phase_warn(
+                    "Layer 2 improver returned EMPTY",
+                    model=raw.get("model", "?"),
+                )
+            else:
+                _wlog.phase_error("Layer 2 improver raised", error=str(raw)[:200])
+
+        for i, d in enumerate(improved):
+            _wlog.save_plan(layer=2, index=i, model_id=d["model"], content=d["answer"])
+
         if not improved:
             warn("Layer 2: all failed, falling back to Layer 1 plans")
+            _wlog.phase_warn("Layer 2 all failed — falling back to Layer 1")
             improved = plans
 
         status(f"Layer 2: got {len(improved)} improved plans (cache: {len(research_cache)} entries)")
+        _wlog.phase_event("Layer 2 done", n_improved=len(improved))
 
 
+        # Same labelled-block style as Layer 1 plans, marked as IMPROVED
+        # so the merger knows it's getting Layer 2 outputs (already
+        # picked + refined), not raw drafts.
         all_improved_text = "\n\n".join(
-            f"=== IMPROVED PLAN BY {d['model'].split('/')[-1].upper()} ===\n{d['answer']}"
-            for d in improved
+            f"──────────────────────────────────────────────────────────────────────\n"
+            f"[INPUT PLAN #{i + 1}] — IMPROVED, by {d['model'].split('/')[-1]}\n"
+            f"──────────────────────────────────────────────────────────────────────\n"
+            f"{d['answer']}"
+            for i, d in enumerate(improved)
         )
 
         # == Layer 3: GLM-5 reads all improved plans, finds flaws/strengths, writes final ==
@@ -4899,26 +5246,12 @@ async def phase_plan(task: str, context: str, complexity: int, project_root: str
             )
 
         merge_prompt = SYSTEM_KNOWLEDGE + MERGE_PROMPT_TEMPLATE.format(
-
-
             n_plans=len(improved),
-
-
             task=task,
-
-
             context=context[:10000],
-
-
             verify_block=verify_block if not is_new_project else "",
-
-
             all_plans_text=all_improved_text[:30000],
-
-
-            preloaded_research=preloaded_research
-
-
+            preloaded_research=preloaded_research,
         )
         merger_result = await _call_with_tools(
             "nvidia/glm-5.1", merge_prompt, project_root,
@@ -4945,26 +5278,12 @@ async def phase_plan(task: str, context: str, complexity: int, project_root: str
             )
 
         merge_prompt = SYSTEM_KNOWLEDGE + MERGE_PROMPT_TEMPLATE.format(
-
-
             n_plans=len(plans),
-
-
             task=task,
-
-
             context=context[:15000],
-
-
             verify_block=verify_block,
-
-
             all_plans_text=all_plans_text,
-
-
-            preloaded_research=preloaded_research
-
-
+            preloaded_research=preloaded_research,
         )
         merger_result = await _call_with_tools(
             "nvidia/glm-5.1", merge_prompt, project_root,
@@ -4975,14 +5294,27 @@ async def phase_plan(task: str, context: str, complexity: int, project_root: str
             stop_on_tool_block=True)
 
     if not merger_result.get("answer"):
+        _wlog.phase_warn("Merger returned EMPTY — falling back to longest Layer-1 plan")
         best = max(plans, key=lambda p: len(p["answer"]))
+        _wlog.save_final_plan(best["answer"], merger_model=f"FALLBACK:{best['model']}")
+        _wlog.phase_end("plan", mode_label, fallback=True, chars=len(best["answer"]))
         return best["answer"], research_cache
 
     best_plan = merger_result["answer"]
-    # Strip [DONE] tag if present — it's a tool loop signal, not plan content
-    best_plan = re.sub(r'\[DONE\]', '', best_plan, flags=re.IGNORECASE).rstrip()
+    # Strip leftover tool-loop signal tags. The tool loop strips fully-formed
+    # two-tag signals before returning, but a bare half (e.g. an isolated
+    # `[CONFIRM_DONE]` produced after the model already stopped) can still
+    # ride through. Drop both halves so plan content is signal-free.
+    for _pat in (r'\[DONE\]', r'\[CONFIRM_DONE\]',
+                 r'\[STOP\]', r'\[CONFIRM_STOP\]',
+                 r'\[CONTINUE\]', r'\[CONFIRM_CONTINUE\]'):
+        best_plan = re.sub(_pat, '', best_plan, flags=re.IGNORECASE)
+    best_plan = best_plan.rstrip()
     status(f"Phase 2: final plan = {len(best_plan)} chars")
     success(f"Phase 2 complete ({mode_label}, {len(research_cache)} cached lookups)")
+    _wlog.save_final_plan(best_plan, merger_model=merger_result.get("model", "nvidia/glm-5.1"))
+    _wlog.phase_end("plan", mode_label, chars=len(best_plan),
+                    research_cache_entries=len(research_cache))
     return best_plan, research_cache
 
 
@@ -5060,14 +5392,30 @@ def _extract_impl_steps(plan: str) -> list[dict]:
         num = int(m.group(1))
         name = m.group(2).strip()
 
-        # Get the body of this step (text until next ### STEP or ## heading)
+        # Get the body of this step (text until next ### STEP or end-of-plan)
         start = m.end()
         if i + 1 < len(matches):
             end = matches[i + 1].start()
         else:
-            # Until next ## heading or end of section
-            next_heading = re.search(r'\n##\s+[A-Z]', plan_scoped[start:])
-            end = start + next_heading.start() if next_heading else len(plan_scoped)
+            # LAST step — terminate at one of the KNOWN trailing section
+            # headers that come AFTER all `### STEP N:` blocks in the plan
+            # template. We CANNOT use a generic `\n##\s+[A-Z]` matcher
+            # because step bodies often quote those headers as prose/example
+            # content (e.g. "## EDGE CASES" inside a description), which
+            # would silently truncate the last step's body.
+            terminators = [
+                r'\n##\s+COMPLETENESS\b',
+                r'\n##\s+EDGE\s+CASES\b',
+                r'\n##\s+VERIFICATION\b',
+                r'\n##\s+TEST\s+CRITERIA\b',
+                r'\n##\s+PRE-?MORTEM\s+RESOLUTION\b',
+                r'\n##\s+CONFIDENCE\s+GATE\b',
+            ]
+            term_pat = re.compile(
+                "|".join(terminators), re.IGNORECASE,
+            )
+            next_term = term_pat.search(plan_scoped[start:])
+            end = start + next_term.start() if next_term else len(plan_scoped)
         body = plan_scoped[start:end]
 
         # Skip duplicate step numbers — keep only the first occurrence.
@@ -5151,6 +5499,20 @@ def _dedup_against_seen(extracted: dict, seen_keys: set[str]) -> dict:
             if ln.strip()
         ).strip()
 
+    def _norm_fp(fp: str) -> str:
+        # Normalise filepath so semantically-equal paths hash to the same key.
+        # Without this, the same edit written twice with `tools/foo.py` and
+        # `./tools/foo.py` (or trailing whitespace) produced two distinct
+        # dedup keys, and the second copy applied a second time — duplicating
+        # the change on disk.
+        if not fp:
+            return ""
+        s = fp.strip().replace("\\", "/")
+        # Strip leading "./" segments
+        while s.startswith("./"):
+            s = s[2:]
+        return s.lower()
+
     def _hash(*parts) -> str:
         h = hashlib.sha1()
         for p in parts:
@@ -5158,12 +5520,12 @@ def _dedup_against_seen(extracted: dict, seen_keys: set[str]) -> dict:
             h.update(str(p).encode("utf-8", "replace"))
         return h.hexdigest()
 
-    # Text edits: keyed on (filepath, normalized search, normalized replace)
+    # Text edits: keyed on (NORMALISED filepath, normalized search, normalized replace)
     new_text_edits: dict[str, list] = {}
     for fp, edits in extracted.get("text_edits", {}).items():
         kept = []
         for find_text, replace_text in edits:
-            key = "text::" + _hash(fp, _norm(find_text), _norm(replace_text))
+            key = "text::" + _hash(_norm_fp(fp), _norm(find_text), _norm(replace_text))
             if key not in seen_keys:
                 seen_keys.add(key)
                 kept.append((find_text, replace_text))
@@ -5171,12 +5533,12 @@ def _dedup_against_seen(extracted: dict, seen_keys: set[str]) -> dict:
             new_text_edits[fp] = kept
     extracted["text_edits"] = new_text_edits
 
-    # Line edits: keyed on (filepath, start, end, normalized code)
+    # Line edits: keyed on (NORMALISED filepath, start, end, normalized code)
     new_line_edits: dict[str, list] = {}
     for fp, edits in extracted.get("edits", {}).items():
         kept = []
         for start, end, code in edits:
-            key = "line::" + _hash(fp, start, end, _norm(code))
+            key = "line::" + _hash(_norm_fp(fp), start, end, _norm(code))
             if key not in seen_keys:
                 seen_keys.add(key)
                 kept.append((start, end, code))
@@ -5184,23 +5546,24 @@ def _dedup_against_seen(extracted: dict, seen_keys: set[str]) -> dict:
             new_line_edits[fp] = kept
     extracted["edits"] = new_line_edits
 
-    # New files: keyed on (filepath, normalized content)
+    # New files: keyed on (NORMALISED filepath, normalized content)
     new_files: dict[str, str] = {}
     for fp, content in extracted.get("new_files", {}).items():
-        key = "file::" + _hash(fp, _norm(content))
+        key = "file::" + _hash(_norm_fp(fp), _norm(content))
         if key not in seen_keys:
             seen_keys.add(key)
             new_files[fp] = content
     extracted["new_files"] = new_files
 
-    # Reverts: keyed on filepath + occurrence count (a model may legitimately
-    # revert the same file twice in one response, but it shouldn't happen 5x).
+    # Reverts: keyed on NORMALISED filepath + occurrence count (a model may
+    # legitimately revert the same file twice in one response, but not 5x).
     seen_revert_count: dict[str, int] = {}
     new_reverts = []
     for rpath in extracted.get("reverts", []):
-        n = seen_revert_count.get(rpath, 0)
-        key = f"revert::{rpath}::{n}"
-        seen_revert_count[rpath] = n + 1
+        nfp = _norm_fp(rpath)
+        n = seen_revert_count.get(nfp, 0)
+        key = f"revert::{nfp}::{n}"
+        seen_revert_count[nfp] = n + 1
         if key not in seen_keys:
             seen_keys.add(key)
             new_reverts.append(rpath)
@@ -5280,12 +5643,19 @@ def _apply_extracted_code(
     # The model may write [REVERT FILE: path] then provide fresh edits in
     # the same response. Reverting before applying means those new edits
     # go on top of the restored state.
+    #
+    # We mutate the caller's `file_contents` dict in place so that:
+    #   1. Subsequent edits in THIS function see the reverted state.
+    #   2. The caller (which holds the same dict reference) also sees the
+    #      revert without having to mirror what `result` says.
+    # The previous local rebind (`file_contents = dict(file_contents)`)
+    # hid the revert from the caller's view, so any check it did against
+    # `file_contents` post-call was stale.
     for rpath in extracted.get("reverts", []):
         matched_fp = _match_fp(rpath)
         prior = _pop_revert_state(matched_fp)
         if prior is not None:
             result[matched_fp] = prior
-            file_contents = dict(file_contents)
             file_contents[matched_fp] = prior  # subsequent edits target reverted state
             success(f"    Reverted {matched_fp} to prior state")
         else:
@@ -5367,6 +5737,15 @@ def _apply_extracted_code(
                     working = modified if m > 0 else existing
                     if m > 0:
                         result[matched_fp] = modified
+                    elif not line_edits:
+                        # Text edits matched ZERO times AND there are no line
+                        # edits coming downstream to claim/discard the snapshot.
+                        # Without popping here, the snapshot sits orphaned on
+                        # the LIFO stack — a later legitimate [REVERT FILE:]
+                        # would pop that wrong (much older) state, silently
+                        # destroying correct intermediate edits.
+                        _pop_revert_state(matched_fp)
+                        pushed_revert = False
                 total_matched += m
                 total_attempted += t
             else:
@@ -5391,6 +5770,32 @@ def _apply_extracted_code(
         # text+line edits is ambiguous).
         if line_edits:
             viewed = _resolve_viewed(matched_fp, raw_fp)
+            # GUARD: line edits MUST anchor to a viewed snapshot when one
+            # is available. If `viewed_versions` is provided AND the file
+            # has no entry there, the model wrote `[REPLACE LINES N-M]`
+            # without ever having a full read of the file (typical when
+            # only a SKELETON was returned for a large file). Applying
+            # those line numbers to the at-apply state silently lands on
+            # the wrong code. Reject + surface a skip message.
+            if viewed is None and viewed_versions is not None and existing:
+                all_ambiguous_skips.append(
+                    f"- [REPLACE LINES] / [INSERT AFTER] / [DELETE] on "
+                    f"{matched_fp} REJECTED: you have not read a full "
+                    f"version of this file in this response. Line numbers "
+                    f"would anchor to whatever the file looks like at "
+                    f"apply time, which may differ from what you reasoned "
+                    f"about. Either [CODE: {matched_fp}] (small files) or "
+                    f"[CODE: {matched_fp}] + [KEEP: {matched_fp} N-M] "
+                    f"(large files) first, then re-issue the line edit."
+                )
+                total_attempted += len(line_edits)
+                # Drop any snapshot we pushed for text edits that didn't
+                # produce changes (none, since text path either matched or
+                # already cleaned up).
+                if pushed_revert and matched_fp not in result:
+                    _pop_revert_state(matched_fp)
+                    pushed_revert = False
+                continue
             basis = viewed if viewed is not None else working
             n_edits = len(line_edits)
             total_attempted += n_edits
@@ -5782,6 +6187,21 @@ VERIFIED REQUIREMENTS — you MUST NOT write VERIFIED unless:
   the file, or fix the issue first.
 
 ══════════════════════════════════════════════════════════════════════
+"NO CHANGES NEEDED" — STRICT MARKER
+══════════════════════════════════════════════════════════════════════
+
+If after verification you determine that NO fix is needed (the coder's
+edits are correct and the step's requirement is already true), AND you
+want to close the step as a no-op fix-pass, write this LITERAL line:
+
+  STEP COMPLETE: NO CHANGES NEEDED
+
+Then [DONE][CONFIRM_DONE]. Fuzzy phrases like "looks correct", "all
+good", "works as expected" no longer trigger the no-op exit — only the
+literal marker above does. The marker also requires you have read the
+file in this round (see VERIFIED REQUIREMENTS above).
+
+══════════════════════════════════════════════════════════════════════
 HARD RULES
 ══════════════════════════════════════════════════════════════════════
 
@@ -5797,11 +6217,11 @@ CONTEXT
 ═══════════════════════════════════════════════════════════════════════
 
 ══════════════════════════════════════════════════════════════════════
-USER REQUEST — the human's actual task (this is what you must serve)
+[USER REQUEST] — the human's actual task (this is what you must serve)
 ══════════════════════════════════════════════════════════════════════
 TASK: {task}
 ══════════════════════════════════════════════════════════════════════
-END OF USER REQUEST — everything below is JARVIS framing / facts / context
+[END USER REQUEST] — everything below is JARVIS framing / facts / context
 ══════════════════════════════════════════════════════════════════════
 STEP: {step_name}
 {step_details}
@@ -5920,6 +6340,9 @@ async def _implement_one_step(
     prev_attempt_thinking = ""
     prev_attempt_summary = ""
     for attempt in range(1, MAX_RETRIES + 1):
+        _wlog.phase_event(
+            f"Step {step_num} attempt {attempt}/{MAX_RETRIES}",
+        )
         # Only load files this step modifies
         step_file_contents = {}
         modify_set = set()
@@ -6138,7 +6561,12 @@ async def _implement_one_step(
                     file_contents[fp] = content
             matched = len(produced)
             total = matched
-            ambiguous_skips = late_skips if late_produced else []
+            # Surface every late skip — the model needs to see why post-STOP
+            # blocks failed, even when no new file was produced. Hiding skips
+            # when `late_produced` was empty made the retry loop see "no code
+            # produced" instead of "your SEARCH didn't match", and burnt the
+            # MAX_RETRIES budget retrying the same broken edit.
+            ambiguous_skips = list(late_skips)
         else:
             extracted = _extract_code_blocks(impl_result["answer"])
             produced, matched, total, ambiguous_skips = _apply_extracted_code(
@@ -6166,7 +6594,16 @@ async def _implement_one_step(
             # Check if the model is saying no changes are needed (valid outcome).
             # If it wrote [DONE] and indicated the code is already correct,
             # treat this as a successful no-op rather than retrying forever.
-            answer_lower = impl_result["answer"].lower()
+            #
+            # STRICT MARKER (replaces the fuzzy-phrase exit that used to
+            # false-positive on phrases like "code matches" or "all correct"):
+            # the model must write the LITERAL line `STEP COMPLETE: NO CHANGES
+            # NEEDED` (case-sensitive on the marker, free text around it).
+            # IMPLEMENT_PROMPT and SELF_CHECK_PROMPT teach this marker. Verify
+            # steps still get the verb-based exit because their step body is
+            # explicit about not producing code.
+            answer = impl_result["answer"]
+            answer_lower = answer.lower()
             # [DONE] is stripped from the answer text by _call_with_tools before
             # returning, so NEVER search for "[done]" in answer_lower — it will
             # never be there. Use the explicit flag instead.
@@ -6187,46 +6624,15 @@ async def _implement_one_step(
                 status(f"    Step {step_num}: verified (no changes needed)")
                 break
 
-            no_changes_signals = [
-                "no additional work",
-                "no changes needed",
-                "no changes are needed",
-                "no change needed",
-                "no change is needed",
-                "already handled",
-                "already implemented",
-                "already correct",
-                "no additional changes",
-                "already properly",
-                "existing code already",
-                "no code produced",
-                # verify-step signals — model checked the code and found nothing wrong
-                "verification result",
-                "claims are accurate",
-                "no other entry points",
-                "no bugs found",
-                "no issues found",
-                "no fixes needed",
-                "no edits needed",
-                "no fix needed",
-                "no edit needed",
-                "everything is correct",
-                "all correct",
-                "code is correct",
-                "code matches",
-                "works correctly",
-                "works as expected",
-                "already works",
-            ]
-            if done_signaled and any(s in answer_lower for s in no_changes_signals):
-                status(f"    Step {step_num}: no changes needed (model confirmed existing code is correct)")
+            _NO_CHANGES_MARKER = re.compile(
+                r'STEP\s+COMPLETE:\s*NO\s+CHANGES\s+NEEDED', re.IGNORECASE,
+            )
+            if done_signaled and _NO_CHANGES_MARKER.search(answer):
+                status(
+                    f"    Step {step_num}: no changes needed "
+                    f"(model wrote STEP COMPLETE: NO CHANGES NEEDED)"
+                )
                 break
-
-            # Also exit if the model explicitly confirmed everything is fine
-            # via the verify-step path — check step name/details as a secondary signal
-            if is_verify_step and done_signaled:
-                status(f"    Step {step_num}: verified (no changes needed)")
-                break  # exit retry loop — step is done
             warn(f"    No code produced (attempt {attempt})")
             # Stash thinking so the next attempt knows what was tried
             attempt_thinking = impl_result.get("answer", "")
@@ -6662,6 +7068,7 @@ async def phase_implement(
     Returns: (plan, sandbox_with_changes)
     """
     step("=== Phase 3: IMPLEMENT (per-step loop) ===")
+    _wlog.phase_start("implement", task_chars=len(task), plan_chars=len(plan))
 
     # Collect all target files
     files_to_create = _extract_new_files_from_plan(plan)
@@ -6669,6 +7076,8 @@ async def phase_implement(
 
     # Parse plan steps
     impl_steps = _extract_impl_steps(plan)
+    _wlog.phase_event("Parsed plan", n_steps=len(impl_steps),
+                      n_files=len(set(files_to_modify + files_to_create)))
     for s in impl_steps:
         all_files.extend(s["files"])
     all_files = list(dict.fromkeys(all_files))  # dedup, preserve order
@@ -6705,26 +7114,61 @@ async def phase_implement(
             num = step_info["num"]
             if num in executed_step_nums:
                 warn(f"  STEP {num} already executed — skipping duplicate")
+                _wlog.phase_warn("Duplicate step number — skipped", step=num)
                 continue
             executed_step_nums.add(num)
-            step_result = await _implement_one_step(
-                step_info=step_info,
-                task=task,
-                shared_interfaces=shared_interfaces,
-                file_contents=file_contents,
-                sandbox=sandbox,
-                project_root=project_root,
-                plan=plan,
-                detailed_map=detailed_map,
-                purpose_map=purpose_map,
-                research_cache=research_cache,
+            _wlog.phase_event(
+                f"Step {num} START",
+                name=step_info.get("name", "")[:60],
+                files=",".join(step_info.get("files", []))[:120],
             )
+            try:
+                step_result = await _implement_one_step(
+                    step_info=step_info,
+                    task=task,
+                    shared_interfaces=shared_interfaces,
+                    file_contents=file_contents,
+                    sandbox=sandbox,
+                    project_root=project_root,
+                    plan=plan,
+                    detailed_map=detailed_map,
+                    purpose_map=purpose_map,
+                    research_cache=research_cache,
+                )
+            except Exception as ex:
+                _wlog.phase_error(f"Step {num} raised",
+                                  error=str(ex)[:200])
+                raise
             total_produced.update(step_result)
+            # Per-step snapshot: which files this step actually wrote.
+            step_summary = "\n".join(
+                f"- {fp} ({len(content):,} chars)"
+                for fp, content in step_result.items()
+            ) or "(no files produced)"
+            _wlog.save_step(
+                step_num=num,
+                step_name=step_info.get("name", f"step_{num}")[:40],
+                model_id="(see per-model logs)",
+                content=(
+                    f"# Step {num}: {step_info.get('name', '')}\n\n"
+                    f"## Files produced\n{step_summary}\n\n"
+                    f"## Files declared in step\n"
+                    f"{', '.join(step_info.get('files', [])) or '(none)'}\n\n"
+                    f"## Step body\n{step_info.get('body', '')}\n"
+                ),
+                extra={"files_produced": len(step_result)},
+            )
+            _wlog.phase_event(f"Step {num} END",
+                              files_produced=len(step_result))
 
         if total_produced:
             success(f"Phase 3 complete — {len(total_produced)} files implemented across {len(executed_step_nums)} steps")
+            _wlog.phase_end("implement", n_steps=len(executed_step_nums),
+                            n_files=len(total_produced))
         else:
             warn("Phase 3: no files produced")
+            _wlog.phase_end("implement", n_steps=len(executed_step_nums),
+                            n_files=0, status="empty")
 
         return plan, sandbox
 
@@ -6775,6 +7219,7 @@ async def phase_review(
     Returns: (had_fixes, sandbox)
     """
     step("=== Phase 3.5: CODE REVIEW (single reviewer, all files) ===")
+    _wlog.phase_start("review")
 
     # Collect all changed files
     changed_files = {}
@@ -6785,9 +7230,12 @@ async def phase_review(
 
     if not changed_files:
         status("No changed files to review")
+        _wlog.phase_end("review", status="skipped — no changed files")
         return False, sandbox
 
     status(f"Reviewing {len(changed_files)} changed file(s) together: {', '.join(changed_files.keys())}")
+    _wlog.phase_event("Reviewing files", n_files=len(changed_files),
+                      files=",".join(changed_files.keys())[:200])
 
     # Build file block — small files inline, large files listed for [CODE:]+[KEEP:]
     all_files_block = ""
@@ -6806,23 +7254,11 @@ async def phase_review(
     preloaded_research = _format_research_cache(research_cache)
 
     review_prompt = SYSTEM_KNOWLEDGE + REVIEW_PROMPT_TEMPLATE.format(
-
-
         task=task,
-
-
         plan=plan[:10000],
-
-
         all_files_block=all_files_block,
-
-
         context=context[:8000],
-
-
-        preloaded_research=preloaded_research
-
-
+        preloaded_research=preloaded_research,
     )
     # on_stop for reviewer: apply fix edits mid-stream.
     # Pre-seed viewed_versions with every changed file's content so that
@@ -6917,6 +7353,9 @@ async def phase_review(
         )
         if not has_unapplied:
             success(f"Code review: all {len(changed_files)} files APPROVED")
+            _wlog.save_review(answer, model_id=result.get("model", ""))
+            _wlog.phase_end("review", approved=True, fixes_applied=0,
+                            n_files=len(changed_files))
             return False, sandbox
 
     # Extract and apply edits — reviewer has read the actual files and may use
@@ -6926,16 +7365,33 @@ async def phase_review(
     # reviewer fixes to be silently dropped while reporting "APPROVED".
     if _rev_stop_applied:
         produced = dict(_rev_stop_applied)
-        # Catch any edits written after the last [STOP]
+        # Catch any edits written after the last [STOP]. Dedup against the
+        # mid-stream seen-keys so blocks already applied during the loop
+        # aren't applied a second time here (which would have duplicated
+        # changes on the file and silently invalidated `pre_lines` tracking).
         extracted = _extract_code_blocks(answer)
-        late_produced, late_m, late_t, _ = _apply_extracted_code(extracted, changed_files, sandbox)
+        _dedup_against_seen(extracted, _rev_seen_edit_keys)
+        late_produced, late_m, late_t, late_skips = _apply_extracted_code(
+            extracted, changed_files, sandbox,
+            viewed_versions=_rev_viewed_versions,
+        )
         if late_produced:
             produced.update(late_produced)
+            for fp, content in late_produced.items():
+                sandbox.write_file(fp, content)
+                changed_files[fp] = content
+        for s in late_skips:
+            warn(f"  Review late-skip: {s}")
         rev_matched = len(produced)
         rev_total = rev_matched
     else:
         extracted = _extract_code_blocks(answer)
-        produced, rev_matched, rev_total, _ = _apply_extracted_code(extracted, changed_files, sandbox)
+        produced, rev_matched, rev_total, _skips = _apply_extracted_code(
+            extracted, changed_files, sandbox,
+            viewed_versions=_rev_viewed_versions,
+        )
+        for s in _skips:
+            warn(f"  Review skip: {s}")
 
     if rev_total > 0 and rev_matched < rev_total:
         warn(f"  Review edits: {rev_matched}/{rev_total} matched (some fixes didn't apply)")
@@ -6951,6 +7407,9 @@ async def phase_review(
     else:
         success(f"Code review: all {len(changed_files)} files APPROVED (no actionable fixes)")
 
+    _wlog.save_review(answer, model_id=result.get("model", ""))
+    _wlog.phase_end("review", fixes_applied=total_fixes,
+                    n_files=len(changed_files))
     return total_fixes > 0, sandbox
 
 
@@ -6961,6 +7420,7 @@ async def phase_review(
 async def phase_test(test_command: str, project_root: str) -> dict:
     """Run tests. Only called if user asked for testing."""
     step("═══ Phase 4: TEST ═══")
+    _wlog.phase_start("test", command=test_command)
 
     try:
         result = subprocess.run(
@@ -6975,6 +7435,8 @@ async def phase_test(test_command: str, project_root: str) -> dict:
         else:
             warn(f"Tests FAILED (exit {result.returncode})")
 
+        _wlog.save_test(test_command, output, passed)
+        _wlog.phase_end("test", passed=passed, exit_code=result.returncode)
         return {
             "passed": passed,
             "output": output[:10000],
@@ -6982,9 +7444,13 @@ async def phase_test(test_command: str, project_root: str) -> dict:
         }
     except subprocess.TimeoutExpired:
         warn("Tests timed out (120s)")
+        _wlog.phase_error("Tests timed out (120s)")
+        _wlog.save_test(test_command, "TIMEOUT after 120s", False)
         return {"passed": False, "output": "TIMEOUT after 120s", "exit_code": -1}
     except Exception as e:
         error(f"Test execution failed: {e}")
+        _wlog.phase_error("Test execution failed", error=str(e)[:200])
+        _wlog.save_test(test_command, str(e), False)
         return {"passed": False, "output": str(e), "exit_code": -1}
 
 
@@ -7001,6 +7467,10 @@ async def code_agent(state: AgentState) -> AgentState:
     step("═══ CODING AGENT ═══")
 
     task = state.get("processed_input", state["raw_input"])
+    _wlog.phase_event(
+        "CODING AGENT START",
+        task=task[:200].replace("\n", " "),
+    )
     classification = state.get("classification", {})
     complexity = classification.get("complexity", 5)
 
@@ -7150,7 +7620,21 @@ async def code_agent(state: AgentState) -> AgentState:
                 f"Just write the complete implementation directly."
             )
 
-        context = "\n\n".join(context_parts)
+        # Wrap the project-context blob in the unified labelled-section
+        # marker so the model can clearly identify what's project facts
+        # (factual codebase info from JARVIS) vs. the actual USER REQUEST
+        # vs. its own past responses. Matches the [SYSTEM]/[USER REQUEST]
+        # /[YOUR ...] vocabulary used in the continuation prompt.
+        _ctx_body = "\n\n".join(context_parts)
+        context = (
+            "══════════════════════════════════════════════════════════════════════\n"
+            "[PROJECT CONTEXT] — factual info about this codebase (JARVIS, not the user)\n"
+            "══════════════════════════════════════════════════════════════════════\n"
+            f"{_ctx_body}\n"
+            "══════════════════════════════════════════════════════════════════════\n"
+            "[END PROJECT CONTEXT]\n"
+            "══════════════════════════════════════════════════════════════════════"
+        )
 
         # Create sandbox
         sandbox.setup()
@@ -7318,7 +7802,7 @@ def _guess_filename(task: str, content: str) -> str:
     if "public class" in content_start or "public static void main" in content_start:
         return "Main.java"
     if "#include" in content_start:
-        return "main.cpp" if "iostream" in content_start else "main.c"
+        return "main.cpp" if "iostream" or "cstdio" in content_start else "main.c"
     if "theorem " in content_start or "import Mathlib" in content_start:
         return "proof.lean"
     if content_start.strip().startswith("{"):

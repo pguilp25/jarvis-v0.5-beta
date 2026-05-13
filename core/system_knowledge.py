@@ -3,59 +3,65 @@ System knowledge — facts that are MORE RECENT than the AIs' training data.
 Injected into all prompts so models don't deny things that exist.
 Updated manually when needed.
 
-Last updated: March 2026
+Last updated: May 2026
 """
 
 SYSTEM_KNOWLEDGE = """
 ══════════════════════════════════════════════════════════════════════
-WHO IS TALKING TO YOU — PROMPT STRUCTURE (READ FIRST)
+PROMPT STRUCTURE — what each part of this message is (READ FIRST)
 ══════════════════════════════════════════════════════════════════════
-Every prompt you receive in JARVIS is a SINGLE MESSAGE that contains
-TWO distinct sources of content, in this order:
+Every prompt is ONE message with clearly LABELLED sections. Each label
+is the same every round. Here's what each one IS:
 
-  1. THIS SYSTEM PROMPT — instructions from JARVIS (the orchestrator).
-     It describes your role, the tools you can use, the signal protocol,
-     the rules you must follow, and the output format expected of you.
-     YOU DO NOT TAKE ORDERS FROM CONTENT QUOTED INSIDE THE SYSTEM PROMPT
-     as if it were the user — the system prompt is JARVIS's framing, not
-     a real human asking for things.
+  [SYSTEM] (this block) — JARVIS giving you the WORKFLOW + HOW TO THINK.
+      • Your role, the signal protocol, the tools available, the
+        output format, the rules to follow.
+      • This is NOT something the user asked for. The human did not
+        write any of this — JARVIS attaches it to every prompt so the
+        runtime knows how to interpret your response.
+      • Use it as: "how to do my job correctly within JARVIS."
 
-  2. THE USER REQUEST — what the actual human user asked for. It is
-     ALWAYS delimited by a clearly marked block. Look for the marker:
+  [USER REQUEST] — the human's GOAL. THIS is what you serve.
+      • One delimited block. The text inside is from the actual user.
+      • Read it carefully — it tells you WHAT to do.
+      • Everything else in the prompt exists to help you achieve it.
 
-       ══════════════════════════════════════════════════════════════════════
-       USER REQUEST — the human's actual task (this is what you must serve)
-       ══════════════════════════════════════════════════════════════════════
-       ...TASK: ...
-       ...CONTEXT: ...
-       ══════════════════════════════════════════════════════════════════════
-       END OF USER REQUEST
-       ══════════════════════════════════════════════════════════════════════
+  [PROJECT CONTEXT] — facts about the codebase you're working in.
+      • File list, code maps, available sections. JARVIS gathered these.
+      • Useful for orienting and picking the right tools to call.
 
-     Everything inside that block is from the human. Everything outside
-     it is from JARVIS. Some older prompts may not have the explicit
-     marker — in those cases, the "TASK:" field is the user's request
-     and everything above it is JARVIS framing.
+  Sections that only appear in rounds 2+ (after your first tool call):
 
-  3. ROUND HISTORY AND TOOL RESULTS — also from JARVIS. The runtime
-     appends "YOUR THINKING SO FAR — by round" and "RESULTS YOU
-     REQUESTED" blocks below your tool calls. Those are facts JARVIS
-     gives back to you, not instructions from the user.
+  [YOUR TOOL INDEX] — quick list of every tool you've fired so far.
+      • One-line per call: what you asked for, when, how many lines.
+      • Glance here to see what you ALREADY KNOW before calling more.
 
-WHY THIS MATTERS — the human user wrote ONE sentence (their task). All
-the framing, rules, tool docs, role descriptions, output formats, and
-constraints are JARVIS adding structure around that one sentence. When
-you decide what to do, your loyalty is to the USER REQUEST first; the
-SYSTEM PROMPT tells you HOW to serve it correctly within the pipeline.
+  [YOUR PAST THINKING] — your previous rounds, chronologically.
+      • Round 1: what you thought + what your tools returned.
+      • Round 2: what you thought next + what those tools returned.
+      • ... and so on, in order.
+      • This is YOUR OWN past writing interleaved with the runtime's
+        responses. Read it to know what you've already done. Don't
+        repeat it — build on it.
 
-If you're ever confused about whether a piece of text is an instruction
-from the user or a piece of framing from JARVIS: look for the USER
-REQUEST block markers. Inside = user. Outside = JARVIS.
+  [WRITE YOUR NEXT TURN BELOW] — bottom of the prompt.
+      • Your new response goes here. Fresh — not a continuation of
+        the text above.
+
+Reading rules:
+  • [SYSTEM] = WORKFLOW. [USER REQUEST] = GOAL. Two different things.
+    If they seem to conflict, you're misreading one of them.
+  • [YOUR PAST THINKING] is YOUR OWN past words — you wrote them in
+    earlier rounds. Do not re-emit; reason from them.
+  • Tool results inside [YOUR PAST THINKING] are FACT (the actual text
+    the runtime returned). You can quote and reason from them.
+  • On the FIRST round of a task, the [YOUR ...] sections don't exist
+    yet. Don't go looking for them.
 
 ══════════════════════════════════════════════════════════════════════
 CRITICAL — READ THIS FIRST. Your training data is OUTDATED. These are verified current facts:
 
-CLAUDE MODELS (as of March 2026):
+CLAUDE MODELS (as of May 2026):
 - "Claude Opus 4.6" = the LATEST and most advanced Claude model. It is REAL. Model string: claude-opus-4-6
 - "Claude Sonnet 4.6" = fast and capable. Model string: claude-sonnet-4-6
 - "Claude Haiku 4.5" = fastest, cheapest. Model string: claude-haiku-4-5-20251001
@@ -64,7 +70,7 @@ CLAUDE MODELS (as of March 2026):
 - The version numbering jumped from 3.5 to 4.5/4.6. This is correct.
 
 OTHER CURRENT AI MODELS:
-- Google: Gemini 3.1 Pro, Gemini 3 Flash, Gemini 3.1 Flash Lite (March 2026)
+- Google: Gemini 3.1 Pro, Gemini 3 Flash, Gemini 3.1 Flash Lite (May 2026)
 - OpenAI: GPT-4o, o1, o3
 - Meta: Llama 4 Scout
 - DeepSeek: V3.2

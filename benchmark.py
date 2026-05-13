@@ -74,7 +74,6 @@ async def main():
     # ── Groq Models ──────────────────────────────────────────────────
     groq_models = [
         ("groq/llama-3.1-8b",  "llama-3.1-8b-instant",                        "8B fast"),
-        ("groq/kimi-k2",       "moonshotai/kimi-k2-instruct-0905",            "Kimi K2"),
         ("groq/gpt-oss-120b",  "openai/gpt-oss-120b",                         "GPT-OSS 120B"),
         ("groq/llama-4-scout", "meta-llama/llama-4-scout-17b-16e-instruct",   "Scout 17B"),
         ("groq/llama-3.3-70b", "llama-3.3-70b-versatile",                     "Llama 70B"),
@@ -84,9 +83,10 @@ async def main():
     nvidia_models = [
         ("nvidia/deepseek-v3.2",  "deepseek-ai/deepseek-v3.2",           "DeepSeek V3.2"),
         ("nvidia/glm-5",          "z-ai/glm5",                            "GLM-5"),
-        ("nvidia/minimax-m2.5",   "minimaxai/minimax-m2.5",               "MiniMax M2.5"),
+        ("nvidia/minimax-m2.7",   "minimaxai/minimax-m2.7",               "MiniMax M2.7"),
         ("nvidia/qwen-3.5",       "qwen/qwen3.5-397b-a17b",              "Qwen 3.5"),
-        ("nvidia/nemotron-super", "nvidia/nemotron-3-super-120b-a12b",   "Nemotron Super"),
+        ("nvidia/kimi-k2.6",      "moonshotai/kimi-k2.6",                "Kimi K2.6"),
+        ("nvidia/nemotron-super", "nvidia/nemotron-3-super-120b-a12b",   "Nemotron Super (legacy)"),
     ]
 
     results = []

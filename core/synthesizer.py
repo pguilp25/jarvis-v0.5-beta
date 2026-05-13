@@ -12,47 +12,50 @@ from core.retry import call_with_retry
 from core.cli import step, agree, disagree, status
 
 
-VERIFIER_PROMPT = """You are comparing multiple AI answers to the same question.
+VERIFIER_PROMPT = """You compare multiple AI answers to the same question and
+classify the relationship between them in ONE word.
 
 Question: {question}
 
 {answers_block}
 
-Think step by step:
-1. Do they reach the SAME general conclusion, even if they use different words, examples, or structure?
-   → If yes: AGREE
-2. Do they give DIFFERENT answers that are ALL VALID? (different recipes, different recommendations, 
-   different angles on the same topic, different examples)
-   → If yes: COMPLEMENTARY
-3. Do they give DIFFERENT answers where at least one seems WRONG or INCOMPATIBLE with the others?
-   This includes: one claims something the others don't mention at all and it changes the conclusion,
-   one gives completely different facts/numbers, or they reach opposite recommendations.
-   → If yes: CONFLICT
+Classification rules:
+  AGREE         — they reach the SAME general conclusion, even with
+                  different wording, examples, structure, or detail.
+  COMPLEMENTARY — they give DIFFERENT answers that are all VALID
+                  (different recipes, recommendations, angles, examples).
+  CONFLICT      — at least one answer seems WRONG or INCOMPATIBLE
+                  with the others: contradictory facts/numbers, opposite
+                  recommendations, or one claims something the others
+                  contradict in a way that changes the bottom line.
 
-IMPORTANT:
-- Different wording of the same idea = AGREE
-- Different examples supporting the same point = AGREE
-- Different levels of detail = AGREE
-- Different valid recommendations = COMPLEMENTARY
-- One says something completely different that changes the answer = CONFLICT
+Reminders:
+  • Different wording of the same idea           → AGREE
+  • Different examples for the same point        → AGREE
+  • Different levels of detail                   → AGREE
+  • Different valid options for an open question → COMPLEMENTARY
+  • Bottom lines that contradict                 → CONFLICT
 
-Reply with ONLY one word: AGREE, COMPLEMENTARY, or CONFLICT"""
+Reply with ONLY one word: AGREE, COMPLEMENTARY, or CONFLICT."""
 
 
 MERGE_PROMPT = """Multiple AIs gave different but all valid answers to this question.
-Merge them into ONE comprehensive answer that combines the best of ALL.
+Merge them into ONE comprehensive answer that COMBINES the unique content
+from each — do not summarize, do not invent.
 
 Question: {question}
 
 {answers_block}
 
 Rules:
-- Include the unique valuable content from EACH answer
-- Keep ALL calculations, numbers, specific data, and failure mode analyses
-- Remove only exact duplicates — if two AIs mention the same thing differently, keep the better version
-- Organize logically with clear sections
-- The merged answer should be LONGER and MORE DETAILED than any single answer
-- Do NOT summarize or shorten — COMBINE and EXPAND
+- Include the unique valuable content from EACH answer.
+- Keep ALL calculations, numbers, specific data, and failure-mode analyses.
+- Remove only exact duplicates — if two AIs make the same point with
+  different wording, keep the clearer version.
+- Organize logically with clear sections.
+- Do NOT summarize or shorten the inputs.
+- Do NOT add content that wasn't in any input — "expand" only by
+  including content other answers had that this output is missing.
 
 Write the complete merged answer:"""
 
@@ -147,7 +150,7 @@ async def synthesize(question: str, answers: list[dict]) -> dict:
     total_tokens = len(block) // 4
 
     if total_tokens < 8000:
-        model = "groq/kimi-k2"
+        model = "nvidia/kimi-k2.6"
     else:
         model = "nvidia/glm-5"
 
@@ -178,9 +181,19 @@ async def synthesize(question: str, answers: list[dict]) -> dict:
 
 
 def _format_answers(answers: list[dict]) -> str:
-    """Format answers for prompts."""
+    """Format answers for prompts.
+
+    Uses `══` block markers rather than `---` because triple-dash is the
+    same shape as a git diff hunk header — models occasionally interpret
+    answer blocks as diff context and lose the surrounding instruction.
+    """
     parts = []
     for i, a in enumerate(answers):
         model = a["model"].split("/")[-1]
-        parts.append(f"--- AI-{i+1} ({model}) ---\n{a['answer']}\n")
+        parts.append(
+            f"══════════════════════════════════════════════════════════════════════\n"
+            f"ANSWER {i+1} of {len(answers)} — model: {model}\n"
+            f"══════════════════════════════════════════════════════════════════════\n"
+            f"{a['answer']}\n"
+        )
     return "\n".join(parts)

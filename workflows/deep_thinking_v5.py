@@ -43,9 +43,9 @@ MAX_CYCLES = 100
 ALL_NVIDIA = [
     "nvidia/deepseek-v4-pro",
     "nvidia/glm-5",
-    "nvidia/minimax-m2.5",
+    "nvidia/minimax-m2.7",
     "nvidia/qwen-3.5",
-    "nvidia/nemotron-super",
+    "nvidia/kimi-k2.6",
 ]
 
 # ─── Text-mode verification (same as v4) ────────────────────────────────────

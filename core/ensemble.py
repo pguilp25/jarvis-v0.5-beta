@@ -60,9 +60,9 @@ async def _two_step_ensemble(
         models = [
             "nvidia/deepseek-v4-pro",
             "nvidia/glm-5",
-            "nvidia/minimax-m2.5",
+            "nvidia/minimax-m2.7",
             "nvidia/qwen-3.5",
-            "nvidia/nemotron-super",
+            "nvidia/kimi-k2.6",
         ]
     else:
         pair = select_domain_pair(domain)
@@ -94,9 +94,15 @@ def _build_prompt(query: str, context: str, assumption_prompt: str, last_exchang
     agent_name = "chat_very_intelligent" if complexity >= 7 else "chat_intelligent"
     parts = [get_agent_context(agent_name), "", SYSTEM_KNOWLEDGE, ""]
     if context:
-        parts.append(f"CONVERSATION CONTEXT:\n{context}\n")
+        parts.append(
+            f"CONVERSATION CONTEXT (recent turns for tracking the thread):\n"
+            f"{context}\n"
+        )
     if last_exchange:
-        parts.append(f"LAST EXCHANGE:\n{last_exchange}\n")
+        parts.append(
+            f"LAST EXCHANGE (the immediate prior message — the user is most\n"
+            f"likely referring to this):\n{last_exchange}\n"
+        )
     if assumption_prompt:
         parts.append(f"ANALYSIS REQUIREMENTS:\n{assumption_prompt}\n")
 
@@ -124,11 +130,14 @@ AFTER your answer, on a NEW line write exactly:
 Then 1-3 short bullet points noting: what topic was discussed, any subject changes, key terms.""")
 
     parts.append(f"""
-════════════════════════════════════════
-USER QUERY (read this completely — including ALL numbered items, constraints, and rules):
-════════════════════════════════════════
+══════════════════════════════════════════════════════════════════════
+[USER REQUEST] — the human's actual task (this is what you must serve)
+══════════════════════════════════════════════════════════════════════
 {query}
-════════════════════════════════════════""")
+══════════════════════════════════════════════════════════════════════
+[END USER REQUEST] — read it completely, including ALL numbered items,
+constraints, and rules.
+══════════════════════════════════════════════════════════════════════""")
 
     return "\n".join(parts)
 
@@ -141,18 +150,27 @@ def _build_step_a(query: str, context: str, assumption_prompt: str, last_exchang
     from core.agent_context import get_agent_context
     parts = [get_agent_context("chat_very_intelligent"), "", SYSTEM_KNOWLEDGE, ""]
     if context:
-        parts.append(f"CONVERSATION CONTEXT:\n{context}\n")
+        parts.append(
+            f"CONVERSATION CONTEXT (recent turns for tracking the thread):\n"
+            f"{context}\n"
+        )
     if last_exchange:
-        parts.append(f"LAST EXCHANGE:\n{last_exchange}\n")
+        parts.append(
+            f"LAST EXCHANGE (the immediate prior message — the user is most\n"
+            f"likely referring to this):\n{last_exchange}\n"
+        )
     if assumption_prompt:
         parts.append(f"ANALYSIS REQUIREMENTS:\n{assumption_prompt}\n")
 
     parts.append(f"""
-════════════════════════════════════════
-USER QUERY (read completely — ALL constraints and rules):
-════════════════════════════════════════
+══════════════════════════════════════════════════════════════════════
+[USER REQUEST] — the human's actual task (this is what you must serve)
+══════════════════════════════════════════════════════════════════════
 {query}
-════════════════════════════════════════
+══════════════════════════════════════════════════════════════════════
+[END USER REQUEST] — read it completely, including ALL constraints
+and rules.
+══════════════════════════════════════════════════════════════════════
 
 YOUR TASK — PLANNING PHASE ONLY (do NOT write the full answer yet):
 
@@ -196,11 +214,13 @@ and produced hypotheses. Your job:
 2. VERIFY each hypothesis — is it correct? Does it address the constraint?
 3. WRITE the complete, thorough final answer
 
-════════════════════════════════════════
-ORIGINAL QUERY:
-════════════════════════════════════════
+══════════════════════════════════════════════════════════════════════
+[USER REQUEST] — the human's actual task (this is what you must serve)
+══════════════════════════════════════════════════════════════════════
 {query}
-════════════════════════════════════════
+══════════════════════════════════════════════════════════════════════
+[END USER REQUEST]
+══════════════════════════════════════════════════════════════════════
 
 PLANNING AI's OUTPUT (hypotheses + approach):
 {step_a_output}
@@ -236,7 +256,7 @@ async def _mixed_ensemble_small(prompt: str, domain: str) -> list[dict]:
     """< 8K context: 2 Groq + 1 NVIDIA — ALL parallel."""
     pair = select_domain_pair(domain)
     tasks = [
-        _call_one("groq/kimi-k2", prompt),
+        _call_one("nvidia/kimi-k2.6", prompt),
         _call_one("groq/gpt-oss-120b", prompt),
         _call_one(pair[0], prompt),
     ]
@@ -275,9 +295,9 @@ async def _nvidia_ensemble_5(prompt: str, ctx_tokens: int) -> list[dict]:
     all_nvidia = [
         "nvidia/deepseek-v4-pro",
         "nvidia/glm-5",
-        "nvidia/minimax-m2.5",
+        "nvidia/minimax-m2.7",
         "nvidia/qwen-3.5",
-        "nvidia/nemotron-super",
+        "nvidia/kimi-k2.6",
     ]
     available = [m for m in all_nvidia if m in select_for_context(ctx_tokens, "extreme")]
     if len(available) < 3:

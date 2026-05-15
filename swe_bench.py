@@ -377,7 +377,7 @@ async def run_one_instance(
 # ─── Driver ─────────────────────────────────────────────────────────────────
 
 
-def _select_instances(ds, limit: int, instance_ids: str) -> list[dict]:
+def _select_instances(ds, limit: int, instance_ids: str, seed: int | None) -> list[dict]:
     if instance_ids:
         wanted = {s.strip() for s in instance_ids.split(",") if s.strip()}
         rows = [r for r in ds if r["instance_id"] in wanted]
@@ -387,6 +387,17 @@ def _select_instances(ds, limit: int, instance_ids: str) -> list[dict]:
                   file=_orig_stderr)
         return rows
     n = min(limit, len(ds))
+    # When --seed is set, shuffle the full dataset deterministically then
+    # take the first n. This avoids the "first 50 are all astropy" trap
+    # — SWE-bench_Verified is sorted by repo/issue id, so a head sample
+    # is repo-biased. With a seed, the sample is representative AND
+    # reproducible (same seed → same set, useful for A/B prompt runs).
+    if seed is not None:
+        import random as _random
+        rng = _random.Random(seed)
+        indices = list(range(len(ds)))
+        rng.shuffle(indices)
+        return [ds[i] for i in indices[:n]]
     return [ds[i] for i in range(n)]
 
 
@@ -420,7 +431,7 @@ async def main_async(args) -> None:
     print(f"Loading {DATASET_NAME} split={SPLIT}...", file=_orig_stderr)
     ds = _load_swe_bench_dataset()
 
-    instances = _select_instances(ds, args.limit, args.instance_ids)
+    instances = _select_instances(ds, args.limit, args.instance_ids, args.seed)
     if not instances:
         print("No instances selected — exiting.", file=_orig_stderr)
         return
@@ -507,6 +518,10 @@ def parse_args() -> argparse.Namespace:
                    help="Comma-separated instance_ids; overrides --limit.")
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
                    help=f"Per-instance hard timeout in seconds (default {DEFAULT_TIMEOUT}).")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Random seed: shuffle the dataset before --limit so the "
+                        "sample is representative (the dataset is sorted by repo, "
+                        "so head-sampling is biased). Same seed → same sample.")
     return p.parse_args()
 
 

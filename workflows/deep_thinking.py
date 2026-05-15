@@ -24,8 +24,8 @@ ATTEMPT_LOG_LIMIT = 8000
 ALL_NVIDIA = [
     "nvidia/deepseek-v4-pro",
     "nvidia/glm-5",
-    "nvidia/minimax-m2.7",
-    "nvidia/qwen-3.5",
+    "nvidia/glm-5.1",
+    "nvidia/deepseek-v4-flash",
     "nvidia/kimi-k2.6",
 ]
 

@@ -8,7 +8,7 @@ Each model's full reasoning is appended to its own file as chunks arrive,
 and simultaneously echoed to stderr so you can watch models think in real time.
 
 Files are named after the model short-name, e.g.:
-  deepseek-v4-pro.md, glm-5.md, minimax-m2.7.md, qwen-3.5.md, kimi-k2.6.md
+  deepseek-v4-pro.md, deepseek-v4-flash.md, glm-5.1.md, kimi-k2.6.md,
   llama-4-scout.md, ...
 """
 
@@ -43,17 +43,17 @@ _DIM   = "\033[2m"
 
 # Sorted known model names → stable colour index
 _KNOWN_MODELS = [
+    "deepseek-v4-flash",
     "deepseek-v4-pro",
     "gemini",
     "glm-5",
+    "glm-5.1",
     "gpt-oss-120b",
     "kimi-k2.6",
     "llama-3.1-8b",
     "llama-3.3-70b",
     "llama-4-scout",
-    "minimax-m2.7",
     "nemotron-super",
-    "qwen-3.5",
     "qwen3-32b",
 ]
 

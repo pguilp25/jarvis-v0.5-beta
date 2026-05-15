@@ -83,8 +83,8 @@ async def main():
     nvidia_models = [
         ("nvidia/deepseek-v3.2",  "deepseek-ai/deepseek-v3.2",           "DeepSeek V3.2"),
         ("nvidia/glm-5",          "z-ai/glm5",                            "GLM-5"),
-        ("nvidia/minimax-m2.7",   "minimaxai/minimax-m2.7",               "MiniMax M2.7"),
-        ("nvidia/qwen-3.5",       "qwen/qwen3.5-397b-a17b",              "Qwen 3.5"),
+        ("nvidia/glm-5.1",   "deepseek-ai/deepseek-v4-flash",               "DeepSeek V4 Flash"),
+        ("nvidia/deepseek-v4-flash",       "deepseek-ai/deepseek-v4-flash",              "DeepSeek V4 Flash"),
         ("nvidia/kimi-k2.6",      "moonshotai/kimi-k2.6",                "Kimi K2.6"),
         ("nvidia/nemotron-super", "nvidia/nemotron-3-super-120b-a12b",   "Nemotron Super (legacy)"),
     ]

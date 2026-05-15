@@ -22,12 +22,11 @@ MODELS = {
     "groq/llama-4-scout":    {"window": 128_000, "tpm": 30_000, "provider": "groq"},
 
     # NVIDIA (free, 40 RPM shared, no TPM limit)
-    "nvidia/deepseek-v4-pro":  {"window": 1_000_000, "tpm": None, "provider": "nvidia"},
-    "nvidia/minimax-m2.7":   {"window": 128_000, "tpm": None, "provider": "nvidia"},
-    "nvidia/kimi-k2.6":      {"window": 256_000, "tpm": None, "provider": "nvidia"},
-    "nvidia/qwen-3.5":       {"window": 128_000, "tpm": None, "provider": "nvidia"},
-    "nvidia/glm-5":          {"window": 200_000, "tpm": None, "provider": "nvidia"},
-    "nvidia/glm-5.1":        {"window": 200_000, "tpm": None, "provider": "nvidia"},
+    "nvidia/deepseek-v4-pro":   {"window": 1_000_000, "tpm": None, "provider": "nvidia"},
+    "nvidia/deepseek-v4-flash": {"window": 128_000, "tpm": None, "provider": "nvidia"},
+    "nvidia/kimi-k2.6":         {"window": 256_000, "tpm": None, "provider": "nvidia"},
+    "nvidia/glm-5":             {"window": 200_000, "tpm": None, "provider": "nvidia"},
+    "nvidia/glm-5.1":           {"window": 200_000, "tpm": None, "provider": "nvidia"},
     # nemotron-super kept as a fallback target only — active workflows now
     # route to nvidia/kimi-k2.6 instead. If it's deprecated server-side, the
     # 410 fast-fail in core/retry.py routes downstream automatically.
@@ -55,25 +54,27 @@ GROQ_MODEL_IDS = {
 }
 
 # ─── NVIDIA Model ID Mapping ────────────────────────────────────────────────
+# NOTE: the deepseek-v4-flash API id is my best guess at the NVIDIA NIM
+# slug — verify against build.nvidia.com if requests come back with
+# "model not found" and update this single line.
 
 NVIDIA_MODEL_IDS = {
-    "nvidia/deepseek-v4-pro":  "deepseek-ai/deepseek-v4-pro",
-    "nvidia/minimax-m2.7":   "minimaxai/minimax-m2.7",
-    "nvidia/kimi-k2.6":      "moonshotai/kimi-k2.6",
-    "nvidia/qwen-3.5":       "qwen/qwen3.5-397b-a17b",
-    "nvidia/glm-5":          "z-ai/glm5",
-    "nvidia/glm-5.1":        "z-ai/glm5",
-    "nvidia/nemotron-super": "nvidia/nemotron-3-super-120b-a12b",
-    "nvidia/ultralong-8b":   "nvidia/Llama-3.1-Nemotron-8B-UltraLong-4M-Instruct",
+    "nvidia/deepseek-v4-pro":   "deepseek-ai/deepseek-v4-pro",
+    "nvidia/deepseek-v4-flash": "deepseek-ai/deepseek-v4-flash",
+    "nvidia/kimi-k2.6":         "moonshotai/kimi-k2.6",
+    "nvidia/glm-5":             "z-ai/glm5",
+    "nvidia/glm-5.1":           "z-ai/glm5",
+    "nvidia/nemotron-super":    "nvidia/nemotron-3-super-120b-a12b",
+    "nvidia/ultralong-8b":      "nvidia/Llama-3.1-Nemotron-8B-UltraLong-4M-Instruct",
 }
 
 # ─── Priority Order per Role ─────────────────────────────────────────────────
 
 PRIORITY_ORDER = {
-    "decorticator":  ["nvidia/deepseek-v4-pro", "nvidia/minimax-m2.7", "nvidia/glm-5.1"],
-    "fast_chat":     ["nvidia/kimi-k2.6", "groq/llama-4-scout", "nvidia/minimax-m2.7"],
-    "synthesizer":   ["nvidia/kimi-k2.6", "groq/llama-4-scout", "nvidia/minimax-m2.7", "nvidia/glm-5.1"],
-    "verifier":      ["groq/gpt-oss-120b", "groq/llama-4-scout", "nvidia/qwen-3.5", "nvidia/glm-5.1"],
+    "decorticator":  ["nvidia/deepseek-v4-pro", "nvidia/glm-5.1", "nvidia/deepseek-v4-flash"],
+    "fast_chat":     ["nvidia/kimi-k2.6", "groq/llama-4-scout", "nvidia/glm-5.1"],
+    "synthesizer":   ["nvidia/kimi-k2.6", "groq/llama-4-scout", "nvidia/glm-5.1", "nvidia/deepseek-v4-flash"],
+    "verifier":      ["groq/gpt-oss-120b", "groq/llama-4-scout", "nvidia/deepseek-v4-flash", "nvidia/glm-5.1"],
     "search_exec":   ["groq/llama-3.1-8b"],
     "self_eval":     ["groq/llama-3.1-8b", "groq/llama-4-scout", "nvidia/deepseek-v4-pro"],
     "plan_compare":  ["nvidia/glm-5.1"],
@@ -81,35 +82,37 @@ PRIORITY_ORDER = {
 }
 
 # ─── Domain-Matched Pairs ────────────────────────────────────────────────────
+# Each domain → two distinct models. Where the previous pair had two slots
+# that would now both be glm-5.1 (code/arduino) we substitute the second
+# slot with deepseek-v4-flash to preserve diversity.
 
 BEST_PAIRS = {
-    "math":    ("nvidia/deepseek-v4-pro", "nvidia/qwen-3.5"),
-    "code":    ("nvidia/minimax-m2.7",  "nvidia/glm-5.1"),
-    "science": ("nvidia/qwen-3.5",      "nvidia/deepseek-v4-pro"),
+    "math":    ("nvidia/deepseek-v4-pro", "nvidia/deepseek-v4-flash"),
+    "code":    ("nvidia/glm-5.1",         "nvidia/deepseek-v4-flash"),
+    "science": ("nvidia/deepseek-v4-flash", "nvidia/deepseek-v4-pro"),
     "cfd":     ("nvidia/deepseek-v4-pro", "nvidia/glm-5.1"),
-    "arduino": ("nvidia/minimax-m2.7",  "nvidia/glm-5.1"),
-    "web":     ("nvidia/minimax-m2.7",  "nvidia/qwen-3.5"),
-    "general": ("nvidia/deepseek-v4-pro", "nvidia/minimax-m2.7"),
+    "arduino": ("nvidia/glm-5.1",         "nvidia/deepseek-v4-flash"),
+    "web":     ("nvidia/glm-5.1",         "nvidia/deepseek-v4-flash"),
+    "general": ("nvidia/deepseek-v4-pro", "nvidia/glm-5.1"),
 }
 
 # ─── Fallback Maps ───────────────────────────────────────────────────────────
 
 NVIDIA_FALLBACKS = {
-    "nvidia/deepseek-v4-pro": "nvidia/glm-5.1",
-    "nvidia/glm-5":         "nvidia/glm-5.1",
-    "nvidia/glm-5.1":       "nvidia/kimi-k2.6",
-    "nvidia/minimax-m2.7":  "nvidia/qwen-3.5",
-    "nvidia/qwen-3.5":      "nvidia/deepseek-v4-pro",
-    "nvidia/kimi-k2.6":     "nvidia/deepseek-v4-pro",
-    "nvidia/nemotron-super": "nvidia/kimi-k2.6",
+    "nvidia/deepseek-v4-pro":   "nvidia/glm-5.1",
+    "nvidia/deepseek-v4-flash": "nvidia/deepseek-v4-pro",
+    "nvidia/glm-5":             "nvidia/glm-5.1",
+    "nvidia/glm-5.1":           "nvidia/kimi-k2.6",
+    "nvidia/kimi-k2.6":         "nvidia/deepseek-v4-pro",
+    "nvidia/nemotron-super":    "nvidia/kimi-k2.6",
 }
 
 GROQ_FALLBACKS = {
     "groq/llama-3.1-8b":  "nvidia/deepseek-v4-pro",
     "groq/qwen3-32b":     "nvidia/deepseek-v4-pro",
-    "groq/gpt-oss-120b":  "nvidia/minimax-m2.7",
+    "groq/gpt-oss-120b":  "nvidia/glm-5.1",
     "groq/llama-3.3-70b": "nvidia/deepseek-v4-pro",
-    "groq/llama-4-scout": "nvidia/qwen-3.5",
+    "groq/llama-4-scout": "nvidia/deepseek-v4-flash",
 }
 
 # ─── Compression ─────────────────────────────────────────────────────────────

@@ -76,7 +76,10 @@ _TOOL_USE_CLOSE = re.compile(r'\[/tool\s*use\]', re.IGNORECASE)
 _MASK_PATTERNS: dict[str, re.Pattern] = {
     "code-fence":   re.compile(r'```.*?```', re.DOTALL),
     "backtick":     re.compile(r'`[^`\n]+`'),
-    "think-block":  re.compile(r'<think>.*?</think>', re.DOTALL | re.IGNORECASE),
+    "think-block":  re.compile(
+        r'(?:<think>.*?</think>|\[think\].*?\[/think\])',
+        re.DOTALL | re.IGNORECASE,
+    ),
     # Edit-blocks (full FILE: ... END FILE, or EDIT: ... [/REPLACE]/[/INSERT])
     "edit-file":    re.compile(
         r'===\s*FILE:.*?===\s*END\s+FILE\s*===',

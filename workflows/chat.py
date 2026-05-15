@@ -291,8 +291,8 @@ async def chat_intelligent(state: AgentState) -> AgentState:
     answers = await _race_first_n(
         [
             ("groq/llama-4-scout", full_prompt),
-            ("nvidia/minimax-m2.7", full_prompt),
-            ("nvidia/qwen-3.5", full_prompt),
+            ("nvidia/glm-5.1", full_prompt),
+            ("nvidia/deepseek-v4-flash", full_prompt),
         ],
         n=2,
     )
@@ -341,8 +341,8 @@ async def chat_intelligent(state: AgentState) -> AgentState:
             answers = await _race_first_n(
                 [
                     ("groq/llama-4-scout", augmented_prompt),
-                    ("nvidia/minimax-m2.7", augmented_prompt),
-                    ("nvidia/qwen-3.5", augmented_prompt),
+                    ("nvidia/glm-5.1", augmented_prompt),
+                    ("nvidia/deepseek-v4-flash", augmented_prompt),
                 ],
                 n=2,
             )

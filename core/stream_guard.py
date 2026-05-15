@@ -1,71 +1,60 @@
 """
-Stream-level safety detector.
+Stream-level degeneration detector.
 
-Detects two failure modes that the JARVIS prompt format alone cannot prevent:
+Catches model failure modes that the JARVIS prompt format alone cannot
+prevent — specifically, "stuck-line" repetition. Observed in practice:
+kimi-k2.6 generated `i4|status(f"Step A done...")` 464 times before
+max_tokens cut it off, burning ~10k wasted tokens AND filling the
+model's context with garbage that propagated to the next round.
 
-1. DEGENERATION — model gets stuck repeating the same line. Observed in
-   practice: kimi-k2.6 generated `i4|status(f"Step A done...")` 464 times
-   before max_tokens cut it off, burning ~10k wasted tokens AND filling
-   the model's context with garbage that propagated to the next round.
-
-2. PROMPT HALLUCINATION — model emits literal tokens that ONLY ever
-   appear in JARVIS-side prompt scaffolding ("TOOL RESULTS (cumulative",
-   "[← CODE: ...]", "══ CONTEXT MANIFEST"). When the model starts
-   writing these, it has lost track of what's input vs output and the
-   rest of its response is unreliable.
-
-Both fire from inside the streaming loop: the client passes each new
+Fires from inside the streaming loop: the client passes each new
 visible delta to `DegenerationDetector.check(...)` and aborts the stream
 when it returns a non-None reason. The partial response collected so
 far is still usable — degenerate text only appears at the END.
+
+NOTE: this used to also detect "prompt leak" — when the model started
+emitting tokens that ONLY appeared in JARVIS-side prompt scaffolding.
+Removed: JARVIS is open source, so the prompts are not secret. The
+genuine model-failure cases (stuck-line repetition, low-line diversity)
+are still caught here; the prompt-template-echoing case was conflating
+"model lost track" with "model said something I considered private,"
+and the latter framing was wrong for an OSS project.
 """
 
 from __future__ import annotations
 
-# ── Phrases that ONLY appear in JARVIS prompt scaffolding ───────────────
-# If a model writes any of these in its visible response, it's regurgitating
-# the prompt format back at us — its next tokens cannot be trusted.
-_PROMPT_LEAK_PHRASES = (
-    # New labelled section headers from the unified prompt template.
-    # Models occasionally hallucinate these back into their response
-    # when they've stopped writing real content and started parroting
-    # the prompt scaffold. Catching them aborts the stream cleanly.
-    "[YOUR TOOL INDEX]",
-    "[YOUR PAST THINKING]",
-    "[YOUR PLAN]",
-    "[YOUR TOOL RESULTS]",   # legacy header still possible to leak
-    "[YOUR PRIOR TURNS]",    # legacy header still possible to leak
-    "[WRITE YOUR NEXT TURN BELOW]",
-    "[PROJECT CONTEXT]",
-    "[INPUT PLANS]",         # used by improve / merge phases
-    "[END INPUT PLANS]",
-    "[INPUT PLAN #",         # per-plan labels in improve / merge
-    "────── ROUND",  # the round-section divider used in past_thinking
-    # Legacy headers kept until all paths are migrated:
-    "TOOL RESULTS (cumulative across all tool calls",
-    "══ CONTEXT MANIFEST — what you have actually read",
-    "TOOL CALLS THAT DID NOT FIRE",  # broad — catches "(check your syntax)"
-                                     # hallucinations and the literal banner
-    "BUDGET OVERFLOW — these results were DROPPED",
-    "EDIT APPLICATION RESULTS — what the runtime did",
-    "UNTERMINATED EDIT BLOCK(S)",
-    "YOUR THINKING SO FAR — continuous reasoning",
-    "YOUR PREVIOUS TURNS — DONE, not unfinished",
-    # Continuation-cue arrows (any variant the prompt has used):
-    "↓ Continue your thinking",
-    "↓ Continue writing from where you stopped",
-    "↓ NOW WRITE YOUR NEXT TURN",
-    # Cumulative-result entry prefixes:
-    "\n[← CODE:",
-    "\n[← KEEP:",
-    "\n[← VIEW:",
-    "\n[← REFS:",
-    "\n[← SEARCH:",
+import re
+
+# Empty [tool use]…[/tool use] spam — observed in minimax-m2.7 R6 of
+# 20260513_131849, which emitted ~250 of these in a row until max_tokens
+# killed the stream. The existing line-length filter (LINE_MIN_LEN=20)
+# misses it: `[tool use]` is 10 chars, `[/tool use]` is 11, the body is
+# empty, so every line is filtered out as too short to count.
+#
+# Pattern: an opening tag immediately followed by whitespace/newlines and
+# the closing tag, with no tool tags inside. Tolerates a few "almost
+# empty" cases (a trailing comment, a stray space) by stopping at the
+# first occurrence of `[CODE:`/`[REFS:`/etc. inside.
+_EMPTY_TOOL_USE = re.compile(
+    r'\[tool use\]\s*\[/tool use\]',
+    re.IGNORECASE,
 )
+
+# Scaffold-hallucination — the runtime emits `────── ROUND N — your
+# thinking ──────` / `────── ROUND N — your tool result ──────` headers
+# in [YOUR PAST THINKING]. When the model writes these in its OWN
+# response, it's pretending to be the runtime continuing the conversation
+# — and the content right after is almost always fabricated (e.g.,
+# imagined file contents, fake function signatures). Observed in
+# deepseek-v4-flash R2 of 20260513_143353: model wrote a tool call, then
+# instead of [STOP][CONFIRM_STOP] it wrote `────── ROUND 2 — your tool
+# result ──────` and ~650 lines of invented `code_agent` source.
+# Abort the stream the moment this scaffold appears.
+_SCAFFOLD_MARKER = "────── ROUND"
 
 
 class DegenerationDetector:
-    """Per-stream detector for repetition and prompt hallucination.
+    """Per-stream detector for repetition-style degeneration.
 
     Usage:
         det = DegenerationDetector()
@@ -86,7 +75,6 @@ class DegenerationDetector:
     BLOCK_REPEAT_THRESHOLD = 6  # same N-char block ≥ 6× in lookback → degen
 
     def __init__(self) -> None:
-        self._last_check_pos = 0   # only re-scan new content
         self._tripped = False
         self._reason: "str | None" = None
 
@@ -99,21 +87,33 @@ class DegenerationDetector:
         if self._tripped:
             return self._reason
 
-        # ── 1. Prompt-leak detection (fast, exact-substring) ──────────
-        # Only check newly-appended text to keep this O(new) not O(total).
-        new_text = accumulated[self._last_check_pos:]
-        # Re-include a small overlap so a phrase split across check calls
-        # still matches. Longest phrase is ~70 chars; 100 is safe.
-        overlap_start = max(0, self._last_check_pos - 100)
-        scan_text = accumulated[overlap_start:]
-        for phrase in _PROMPT_LEAK_PHRASES:
-            if phrase in scan_text:
-                self._tripped = True
-                self._reason = f"prompt-leak: model emitted '{phrase[:40]}...'"
-                return self._reason
-        self._last_check_pos = len(accumulated)
+        # ── 0. Empty [tool use]…[/tool use] block spam ──────────────────
+        # Model is generating tool-use shells with no tags inside. Real
+        # tool calls always have at least one tag like [CODE:] / [REFS:]
+        # / etc. inside the block. If we see 3+ empty blocks anywhere in
+        # the accumulated text, the model has lost the plot — abort.
+        _empty_blocks = _EMPTY_TOOL_USE.findall(accumulated)
+        if len(_empty_blocks) >= 3:
+            self._tripped = True
+            self._reason = (
+                f"empty-tool-use-spam: {len(_empty_blocks)} `[tool use]"
+                f"…[/tool use]` blocks with no tags inside"
+            )
+            return self._reason
 
-        # ── 2. Adjacent-line repetition (the kimi failure mode) ───────
+        # ── 0b. Scaffold-hallucination ──────────────────────────────────
+        # Model is writing JARVIS's per-round header into its own response,
+        # which means the content right after is fabricated. Abort.
+        if _SCAFFOLD_MARKER in accumulated:
+            self._tripped = True
+            self._reason = (
+                "scaffold-hallucination: model wrote `"
+                f"{_SCAFFOLD_MARKER}` inside its response (this header is "
+                "runtime-only; content after it is fabricated)"
+            )
+            return self._reason
+
+        # ── 1. Adjacent-line repetition (the kimi failure mode) ───────
         # Cheap fast-path: look only at the tail. If the last 8 non-trivial
         # lines are identical and long enough, the model is stuck.
         # Tail-size: 200 chars per expected line × threshold so realistic
@@ -136,7 +136,7 @@ class DegenerationDetector:
                 )
                 return self._reason
 
-        # ── 3. Low-line-diversity (general periodic pattern) ──────────
+        # ── 2. Low-line-diversity (general periodic pattern) ──────────
         # Catches loops where the model alternates 2-3 lines forever. We
         # don't need to know the period — just count how many DISTINCT
         # non-trivial lines exist in the last 20. If only 1-3 unique

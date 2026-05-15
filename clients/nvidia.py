@@ -15,13 +15,87 @@ from core.rate_limiter import nvidia_limiter
 from core.stream_guard import DegenerationDetector
 
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+LIGHTNING_API_URL = "https://lightning.ai/api/v1/chat/completions"
+DEEPINFRA_API_URL = "https://api.deepinfra.com/v1/openai/chat/completions"
+
+# Models we deliberately route to DeepInfra. Pro is intentionally NOT here:
+# DeepInfra serves Pro FP4-quantized at only 66k context (vs 200k+ on NVIDIA
+# and 1M native), so we keep Pro on NVIDIA/Lightning. Flash on DeepInfra
+# keeps the full 1M context, which is what we want for huge code repos.
+DEEPINFRA_MODELS = {
+    "deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
+}
+
+
+def _route(model_id: str) -> tuple[str, str, str]:
+    """Pick endpoint, auth key, and provider-specific model slug.
+
+    Priority per model:
+      1. DeepInfra — only for models in DEEPINFRA_MODELS (currently Flash,
+         for its full 1M context). Skipped for Pro because DeepInfra
+         FP4-quantizes Pro down to 66k.
+      2. Lightning AI — if LIGHTNING_API_KEY is set, much faster than
+         NVIDIA's free DGX Cloud which returns sporadic 504s under load.
+      3. NVIDIA — integrate.api.nvidia.com (free, occasionally flaky).
+    """
+    base = model_id.split("/", 1)[-1]
+
+    dkey = os.environ.get("DEEPINFRA_API_KEY", "")
+    if dkey and base in DEEPINFRA_MODELS:
+        return DEEPINFRA_API_URL, dkey, DEEPINFRA_MODELS[base]
+
+    lkey = os.environ.get("LIGHTNING_API_KEY", "")
+    if lkey:
+        return LIGHTNING_API_URL, lkey, f"lightning-ai/{base}"
+
+    nkey = os.environ.get("NVIDIA_API_KEY", "")
+    if not nkey:
+        raise RuntimeError("None of DEEPINFRA_API_KEY / LIGHTNING_API_KEY / NVIDIA_API_KEY is set")
+    return NVIDIA_API_URL, nkey, NVIDIA_MODEL_IDS.get(model_id, base)
 
 
 def _get_key() -> str:
+    # Kept for callers (clients/imagen.py) that still need the NVIDIA key directly.
     key = os.environ.get("NVIDIA_API_KEY", "")
     if not key:
         raise RuntimeError("NVIDIA_API_KEY not set")
     return key
+
+
+def _max_thinking_payload(model_id: str) -> dict:
+    """Per-model parameters that force the strongest available reasoning mode.
+
+    Defaults vary by provider/family:
+      • DeepSeek V4 Pro/Flash → `reasoning_effort: "high"` by default; "xhigh"
+        is the documented map for the "max" budget. We also set the explicit
+        `thinking: {type: enabled}` so hosts that key off it (rather than
+        reasoning_effort) still surface reasoning_content.
+      • Kimi K2.6 → thinking is ON by default; we still send the explicit
+        enable so a host that flipped the default doesn't silently disable it.
+      • GLM-5.1 → thinking is ON by default; same belt-and-suspenders
+        approach. We send the canonical `thinking` plus the vLLM-style
+        `chat_template_kwargs` so it works against either parser.
+
+    All values are OpenAI-compatible JSON fields. A host that does not
+    recognize a field generally ignores it; if a provider returns HTTP 400
+    on one of these, narrow this map for that model.
+    """
+    base = model_id.split("/", 1)[-1].lower()
+    if base.startswith("deepseek-v4"):
+        return {
+            "reasoning_effort": "xhigh",
+            "thinking": {"type": "enabled"},
+        }
+    if base.startswith("kimi-"):
+        return {
+            "thinking": {"type": "enabled"},
+        }
+    if base.startswith("glm-"):
+        return {
+            "thinking": {"type": "enabled"},
+            "chat_template_kwargs": {"enable_thinking": True},
+        }
+    return {}
 
 
 async def call_nvidia(
@@ -39,7 +113,7 @@ async def call_nvidia(
     await nvidia_limiter.acquire()
     thinking(model_id)
 
-    api_model = NVIDIA_MODEL_IDS.get(model_id, model_id.split("/", 1)[-1])
+    url, key, api_model = _route(model_id)
 
     messages = []
     if system:
@@ -52,18 +126,19 @@ async def call_nvidia(
         "temperature": temperature,
         # Output-token floor — see call_nvidia_stream for rationale.
         "max_tokens": max(int(max_tokens), 4096),
+        **_max_thinking_payload(model_id),
     }
 
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
     headers = {
-        "Authorization": f"Bearer {_get_key()}",
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
 
     async with aiohttp.ClientSession() as session:
-        async with session.post(NVIDIA_API_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=3600)) as resp:
+        async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=3600)) as resp:
             if resp.status != 200:
                 body = await resp.text()
                 raise RuntimeError(f"NVIDIA {api_model} HTTP {resp.status}: {body[:200]}")
@@ -93,7 +168,7 @@ async def call_nvidia_stream(
     thinking(model_id)
     thought_logger.write_header(model_id, log_label)
 
-    api_model = NVIDIA_MODEL_IDS.get(model_id, model_id.split("/", 1)[-1])
+    url, key, api_model = _route(model_id)
 
     messages = []
     if system:
@@ -133,10 +208,11 @@ async def call_nvidia_stream(
         # message we can surface and handle.
         "max_tokens": max(int(max_tokens), 4096),
         "stream": True,
+        **_max_thinking_payload(model_id),
     }
 
     headers = {
-        "Authorization": f"Bearer {_get_key()}",
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
 
@@ -152,7 +228,7 @@ async def call_nvidia_stream(
     degen_guard = DegenerationDetector()
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            NVIDIA_API_URL, json=payload, headers=headers,
+            url, json=payload, headers=headers,
             timeout=aiohttp.ClientTimeout(total=3600),
         ) as resp:
             if resp.status != 200:

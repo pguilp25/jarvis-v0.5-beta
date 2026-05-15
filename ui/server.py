@@ -532,7 +532,7 @@ async def _on_get_settings(ws):
 async def _on_save_settings(ws, settings: dict):
     current = _load_settings()
     changed = []
-    for key in ["NVIDIA_API_KEY", "GEMINI_API_KEY", "GEMINI_API_KEYS", "GROQ_API_KEY", "OPENROUTER_API_KEY"]:
+    for key in ["NVIDIA_API_KEY", "LIGHTNING_API_KEY", "DEEPINFRA_API_KEY", "GEMINI_API_KEY", "GEMINI_API_KEYS", "GROQ_API_KEY", "OPENROUTER_API_KEY"]:
         val = settings.get(key, "")
         # Don't overwrite with masked value or empty
         if val and not val.startswith("•"):
@@ -544,7 +544,7 @@ async def _on_save_settings(ws, settings: dict):
 
     # Verify the file was actually written
     verify = _load_settings()
-    for key in ["NVIDIA_API_KEY", "GEMINI_API_KEY", "GEMINI_API_KEYS", "GROQ_API_KEY", "OPENROUTER_API_KEY"]:
+    for key in ["NVIDIA_API_KEY", "LIGHTNING_API_KEY", "DEEPINFRA_API_KEY", "GEMINI_API_KEY", "GEMINI_API_KEYS", "GROQ_API_KEY", "OPENROUTER_API_KEY"]:
         if current.get(key) and current[key] != verify.get(key):
             print(f"  WARNING: {key} failed to persist!", flush=True)
 
@@ -574,7 +574,7 @@ async def start_server(port=3000):
     # Load saved API keys into environment — always override
     saved = _load_settings()
     loaded = []
-    for key in ["NVIDIA_API_KEY", "GEMINI_API_KEY", "GEMINI_API_KEYS", "GROQ_API_KEY", "OPENROUTER_API_KEY"]:
+    for key in ["NVIDIA_API_KEY", "LIGHTNING_API_KEY", "DEEPINFRA_API_KEY", "GEMINI_API_KEY", "GEMINI_API_KEYS", "GROQ_API_KEY", "OPENROUTER_API_KEY"]:
         val = saved.get(key, "")
         if val:
             os.environ[key] = val

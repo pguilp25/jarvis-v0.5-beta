@@ -165,7 +165,7 @@ async def mini_debate(
     """
     debating()
     prompt_to_show = original_prompt or question
-    models = ["groq/llama-4-scout", "nvidia/minimax-m2.7", "nvidia/qwen-3.5"]
+    models = ["groq/llama-4-scout", "nvidia/glm-5.1", "nvidia/deepseek-v4-flash"]
 
     all_answers_text = "\n\n".join(
         f"═══ AI-{i+1} ({a['model'].split('/')[-1]}) ═══\n{a['answer']}"
@@ -222,8 +222,8 @@ async def full_debate(
     models = [
         "nvidia/deepseek-v4-pro",
         "nvidia/glm-5",
-        "nvidia/minimax-m2.7",
-        "nvidia/qwen-3.5",
+        "nvidia/glm-5.1",
+        "nvidia/deepseek-v4-flash",
         "nvidia/kimi-k2.6",
     ]
 

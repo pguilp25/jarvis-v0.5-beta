@@ -284,7 +284,7 @@ async def research_agent(state: AgentState) -> AgentState:
     # ══ RESEARCH PIPELINE ════════════════════════════════════════════════
     # Loop A: Steps 3→4 (briefing convergence, max 2)
     # Loop B: Steps 6→7 (conclusion convergence, max 2)
-    briefing_models = ["groq/llama-4-scout", "nvidia/deepseek-v4-pro", "nvidia/qwen-3.5"]
+    briefing_models = ["groq/llama-4-scout", "nvidia/deepseek-v4-pro", "nvidia/deepseek-v4-flash"]
     disagreement_context = ""
 
     # ── LOOP A: Steps 3-4 (briefing convergence) ─────────────────────
@@ -408,7 +408,7 @@ async def research_agent(state: AgentState) -> AgentState:
     # ── Step 5: Merge into final report ──────────────────────────────
     step("Step 5: Merge research")
     briefing = await call_with_retry(
-        "nvidia/qwen-3.5",
+        "nvidia/deepseek-v4-flash",
         MERGE_RESEARCH_PROMPT.format(
             question=query,
             briefing_a=revised_briefings[0][:10000],
@@ -448,7 +448,7 @@ async def research_agent(state: AgentState) -> AgentState:
         conclusions = list(await asyncio.gather(
             _conclude_one("groq/llama-4-scout", conclude_prompt),
             _conclude_one("nvidia/deepseek-v4-pro", conclude_prompt),
-            _conclude_one("nvidia/qwen-3.5", conclude_prompt),
+            _conclude_one("nvidia/deepseek-v4-flash", conclude_prompt),
         ))
         status(f"Got {len(conclusions)} conclusions")
 

@@ -60,8 +60,8 @@ async def _two_step_ensemble(
         models = [
             "nvidia/deepseek-v4-pro",
             "nvidia/glm-5",
-            "nvidia/minimax-m2.7",
-            "nvidia/qwen-3.5",
+            "nvidia/glm-5.1",
+            "nvidia/deepseek-v4-flash",
             "nvidia/kimi-k2.6",
         ]
     else:
@@ -295,8 +295,8 @@ async def _nvidia_ensemble_5(prompt: str, ctx_tokens: int) -> list[dict]:
     all_nvidia = [
         "nvidia/deepseek-v4-pro",
         "nvidia/glm-5",
-        "nvidia/minimax-m2.7",
-        "nvidia/qwen-3.5",
+        "nvidia/glm-5.1",
+        "nvidia/deepseek-v4-flash",
         "nvidia/kimi-k2.6",
     ]
     available = [m for m in all_nvidia if m in select_for_context(ctx_tokens, "extreme")]

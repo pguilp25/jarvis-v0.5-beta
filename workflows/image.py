@@ -157,7 +157,7 @@ async def expand_prompt(user_query: str, context: str = "", last_exchange: str =
 
     try:
         expanded = await call_with_retry(
-            "nvidia/minimax-m2.7",
+            "nvidia/glm-5.1",
             prompt=prompt,
             system=EXPAND_SYSTEM,
             temperature=0.7,

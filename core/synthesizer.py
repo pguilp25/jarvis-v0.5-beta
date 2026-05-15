@@ -109,7 +109,7 @@ async def merge_answers(question: str, answers: list[dict], fast: bool = False) 
     """
     Merge complementary answers.
     fast=True: Flash Lite (for intelligent tier)
-    fast=False: qwen-3.5 (for very intelligent tier)
+    fast=False: deepseek-v4-flash (for very intelligent tier)
     """
     step("Merging complementary answers")
 
@@ -124,7 +124,7 @@ async def merge_answers(question: str, answers: list[dict], fast: bool = False) 
         )
     else:
         merged = await call_with_retry(
-            "nvidia/qwen-3.5",
+            "nvidia/deepseek-v4-flash",
             MERGE_PROMPT.format(question=question, answers_block=block[:60000]),
             max_tokens=16384,
         )

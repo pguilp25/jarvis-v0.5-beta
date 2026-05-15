@@ -131,6 +131,30 @@ PLAN_DONE_TAG = re.compile(
     r'\[PLAN\s+DONE\]\s*\[CONFIRM_PLAN_DONE\]', re.IGNORECASE,
 )
 
+# Both forms count as inline reasoning:
+#   <think>...</think>     — what the streaming clients wrap reasoning_content in
+#   [think]...[/think]     — a bracketed equivalent the model can emit directly
+# A model that lacks a reasoning channel (or whose channel is being lost across
+# rounds) can use [think]...[/think] and get the same handling: visible in the
+# stream, stripped from final plan body, never dispatched as a tool.
+_THINK_BLOCK = re.compile(
+    r'(?:<think>.*?</think>|\[think\].*?\[/think\])',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _strip_think(text: str) -> str:
+    """Remove <think>...</think> and [think]...[/think] blocks so reasoning
+    never lands in the plan body.
+
+    The streaming clients wrap reasoning_content in <think>...</think> as it
+    arrives, and models without a reasoning channel can emit [think]...[/think]
+    directly. Either form gets stripped here so the plan body the coder
+    consumes stays clean — reasoning belongs in the reasoning channel, not
+    interleaved with REQUIREMENTS / STEPS.
+    """
+    return _THINK_BLOCK.sub('', text)
+
 
 def _apply_plan_edits(current_plan: str, edit_body: str) -> tuple[str, list[str]]:
     """Apply REPLACE LINES / INSERT AFTER ops from a PLAN_EDIT body to the
@@ -367,7 +391,11 @@ YOUR WORK SO FAR (continuous — you signaled [CONTINUE] for more space)
 
 _FENCED_CODE_BLOCK = re.compile(r'```.*?```', re.DOTALL)
 _INLINE_BACKTICK = re.compile(r'`[^`\n]+`')
-_THINK_BLOCK = re.compile(r'<think>.*?</think>', re.DOTALL | re.IGNORECASE)
+# Matches both reasoning forms — see _strip_think comment above for rationale.
+_THINK_BLOCK = re.compile(
+    r'(?:<think>.*?</think>|\[think\].*?\[/think\])',
+    re.DOTALL | re.IGNORECASE,
+)
 # Deliberate tool-use blocks: [tool use]...[/tool use]
 # When ANY such block is present in the response, ONLY tags inside these
 # blocks are executed — everything outside is treated as explanatory text.
@@ -422,6 +450,165 @@ _EDIT_TERMINATOR = re.compile(
 )
 _BACKSLASH_BRACKET = re.compile(r'\\\[')
 
+# Plan-body spans — used by signal masking so that a planner writing a
+# `=== PLAN === ... === END PLAN ===` body that documents the JARVIS
+# signal protocol cannot accidentally fire its own [PLAN DONE] from
+# inside that body. The plan body is data (the artifact handed to the
+# coder); signals belong OUTSIDE it. Matched non-greedily and applied
+# in `_mask_quoted_tags_core` alongside the EDIT/FILE block masks.
+_PLAN_BLOCK_SPAN = re.compile(
+    r'===\s*PLAN\s*===.*?===\s*END\s+PLAN\s*===',
+    re.DOTALL | re.IGNORECASE,
+)
+_PLAN_EDIT_BLOCK_SPAN = re.compile(
+    r'===\s*PLAN_EDIT\s*===.*?===\s*END\s+PLAN_EDIT\s*===',
+    re.DOTALL | re.IGNORECASE,
+)
+_PLAN_OPEN = re.compile(r'===\s*PLAN\s*===', re.IGNORECASE)
+_PLAN_CLOSE = re.compile(r'===\s*END\s+PLAN\s*===', re.IGNORECASE)
+_PLAN_EDIT_OPEN = re.compile(r'===\s*PLAN_EDIT\s*===', re.IGNORECASE)
+_PLAN_EDIT_CLOSE = re.compile(r'===\s*END\s+PLAN_EDIT\s*===', re.IGNORECASE)
+
+# PLAN_DONE context validation. A PLAN_DONE pair fires only when it
+# appears in one of these structurally valid positions:
+#
+#   1. After `=== END PLAN ===`     (signal terminates a closed plan body)
+#   2. After a canonical terminal   (e.g. ## VERIFICATION) — the model wrote
+#      section header                  the conventional "I'm done" section
+#   3. After a closed [think] /     (model reasoned about an early commit
+#      <think> block                  and is explicitly justifying it)
+#
+# Everything else is treated as a stray signal: PLAN_DONE written mid-
+# investigation, written inside prose that's documenting the protocol,
+# or emitted by accident. The runtime injects a one-shot correction
+# explaining the rule and gives the model another round.
+#
+# The terminal-section list covers the canonical names used by:
+#   - PLAN_COT_EXISTING       → ## VERIFICATION
+#   - PLAN_COT_NEW            → ## CONFIDENCE GATE / ## TEST CRITERIA
+#   - MERGE_PROMPT_TEMPLATE   → ## PRE-MORTEM RESOLUTION
+#   - informal / merger tail  → ## FINAL NOTES, ## SUMMARY
+# Add a new name here when a workflow introduces a new terminal section.
+_PLAN_TERMINAL_SECTION = re.compile(
+    r'^[ \t]*##[ \t]*'
+    r'(?:VERIFICATION'
+    r'|CONFIDENCE[ \t]+GATE'
+    r'|PRE[-\s]?MORTEM[ \t]+RESOLUTION'
+    r'|TEST[ \t]+CRITERIA'
+    r'|FINAL[ \t]+NOTES'
+    r'|SUMMARY)'
+    r'\b',
+    re.MULTILINE | re.IGNORECASE,
+)
+_PLAN_END_BLOCK = re.compile(r'===\s*END\s+PLAN\s*===', re.IGNORECASE)
+_THINK_CLOSE_TAG = re.compile(r'</think>|\[/think\]', re.IGNORECASE)
+# Generous look-back windows — the model may write a couple of paragraphs
+# between the canonical marker and the actual signal (e.g. "the plan is
+# complete; the user will observe X; ready to commit" + [PLAN DONE]).
+_PLAN_DONE_LONG_LOOKBACK = 2000   # for END PLAN / terminal section
+_PLAN_DONE_SHORT_LOOKBACK = 800   # for [/think] (kept tighter because
+                                  # the model should think THEN commit
+                                  # immediately, not write more prose)
+
+
+# Backtrack-in-response directive. Models can write
+#
+#   [continue from: -N]
+#
+# on its own line to erase the N lines IMMEDIATELY PRECEDING the
+# directive (plus the directive's own line) before downstream processing
+# sees the response. Use case: the model wrote a wrong edit or a wrong
+# plan step, then in [think] realized the mistake; instead of explaining
+# the wrong content in its visible output it backtracks and rewrites.
+#
+# Directives inside masked contexts (code fences, backticks, [think] /
+# <think> blocks) are treated as documentation and NOT applied — quoting
+# the syntax in a prompt or example doesn't fire it. Anywhere else, the
+# directive fires.
+#
+# N is a positive integer. N=0 or N>500 is treated as invalid and the
+# directive is stripped (but no content erased). Multiple directives in
+# one response are applied in document order; each operates on the state
+# produced by the previous one.
+_CONTINUE_FROM_RE = re.compile(
+    r'\[continue\s+from:\s*-(\d+)\s*\]',
+    re.IGNORECASE,
+)
+
+
+def _apply_continue_from(text: str) -> str:
+    """Apply [continue from: -N] backtrack directives to `text`.
+
+    Each application:
+      1. Locates the first directive in the masked view of the text
+         (so directives inside fences / backticks / think blocks are
+         skipped — they're documentation, not commands).
+      2. Walks back N newlines in the ORIGINAL text from the directive
+         position, finding the start of the N-th line above the
+         directive's own line. Position 0 if N exceeds available
+         lines (erases everything before the directive).
+      3. Removes the range [cut_at, directive_end_plus_trailing_newline)
+         from the original text. The directive's line vanishes; the
+         lines above it are gone.
+      4. Loops to handle the next directive.
+
+    Returns the rewritten text. Idempotent on text with no directives.
+    """
+    while True:
+        masked = _mask_for_signals(text)
+        m = _CONTINUE_FROM_RE.search(masked)
+        if not m:
+            return text
+        try:
+            n = int(m.group(1))
+        except ValueError:
+            n = 0
+        if n <= 0 or n > 500:
+            # Malformed or absurd backtrack — strip the directive,
+            # keep surrounding text. The 500-line ceiling is a sanity
+            # guard against pathological models.
+            text = text[:m.start()] + text[m.end():]
+            continue
+
+        before = text[:m.start()]
+        newline_positions = [i for i, ch in enumerate(before) if ch == '\n']
+        # To erase N content lines plus the directive's own line prefix,
+        # we cut starting right after the (n+1)-th-from-end newline.
+        # Example: text = "A\nB\nC\n[continue from: -2]\nD"
+        #          before = "A\nB\nC\n"      newlines at [1, 3, 5]
+        #          n=2 -> needed=3 -> newline_positions[-3]=1 -> cut_at=2
+        #          (start of "B")
+        # If we don't have enough newlines, cut from 0 (erase all prefix).
+        if len(newline_positions) >= n + 1:
+            cut_at = newline_positions[-(n + 1)] + 1
+        else:
+            cut_at = 0
+
+        end = m.end()
+        # Consume the directive's trailing newline so we don't leave a
+        # blank gap where it used to live.
+        if end < len(text) and text[end] == '\n':
+            end += 1
+        text = text[:cut_at] + text[end:]
+
+
+def _plan_done_context_kind(text: str, signal_start: int) -> "str | None":
+    """Return a short name for the valid context preceding a PLAN_DONE
+    match, or None if no valid context is present.
+
+    Context names are also used as diagnostics in the runtime logs so a
+    debugger can see WHY a particular [PLAN DONE] was honored.
+    """
+    long_window = text[max(0, signal_start - _PLAN_DONE_LONG_LOOKBACK):signal_start]
+    if _PLAN_END_BLOCK.search(long_window):
+        return "end-plan-block"
+    if _PLAN_TERMINAL_SECTION.search(long_window):
+        return "terminal-section"
+    short_window = text[max(0, signal_start - _PLAN_DONE_SHORT_LOOKBACK):signal_start]
+    if _THINK_CLOSE_TAG.search(short_window):
+        return "post-think"
+    return None
+
 
 def _detect_unterminated_blocks(text: str) -> list[tuple[str, str]]:
     """Return a list of (kind, filepath) for every `=== FILE:` or `=== EDIT:`
@@ -474,19 +661,102 @@ def _mask_quoted_tags_core(text: str, enforce_tool_use_blocks: bool) -> str:
     for m in _THINK_BLOCK.finditer(text):
         _blank(m.start(), m.end())
 
+    # 0b. UNCLOSED <think>...EOT — during streaming the closing tag
+    # hasn't arrived yet. Without this, a model that mentions
+    # [STOP][CONFIRM_STOP] inside its still-open thinking (e.g. while
+    # discussing the protocol) triggers stop_check, the stream aborts
+    # mid-thought, and the model never returns to write its real
+    # response. Observed before this fix: qwen-3.5 / minimax-m2.7
+    # rounds that ended on a [CONFIRM_STOP] inside an unterminated
+    # <think> block, with no visible content after. Mask from the
+    # FIRST unclosed <think> to end of text.
+    _think_opens = [m.start() for m in re.finditer(r'<think>', text, re.IGNORECASE)]
+    _think_closes = [m.start() for m in re.finditer(r'</think>', text, re.IGNORECASE)]
+    if len(_think_opens) > len(_think_closes):
+        # The (len(closes))th open (0-indexed) is the first one unclosed.
+        _blank(_think_opens[len(_think_closes)], len(text))
+
     # 1. Fenced code blocks (```...```)
     for m in _FENCED_CODE_BLOCK.finditer(text):
         _blank(m.start(), m.end())
 
+    # 1b. UNCLOSED fenced code (```...EOT) — same streaming risk.
+    # If the model opens ``` and mentions a signal inside before the
+    # closing ``` arrives, the signal would fire prematurely. Count
+    # the ``` markers; if odd, the last one is unclosed.
+    _fence_positions = [m.start() for m in re.finditer(r'```', text)]
+    if len(_fence_positions) % 2 == 1:
+        _blank(_fence_positions[-1], len(text))
+
     # 2. Inline backtick spans (`...`)
     for m in _INLINE_BACKTICK.finditer(text):
         _blank(m.start(), m.end())
+
+    # 2b. UNCLOSED inline backticks (`...EOL or `...EOT) — during
+    # streaming the closing ` may not have arrived yet. Observed in
+    # 20260513_173120 glm-5.1: model was streaming
+    #   "Two-tag protocol: `[STOP][CONFIRM_STOP]`, `[DONE][CONFIRM_DONE]…"
+    # and the stop_check ran when [CONFIRM_DONE] arrived — at that
+    # moment the second ` was still unclosed (it would have arrived in
+    # a later delta). The regex above didn't match the unclosed span,
+    # so [DONE][CONFIRM_DONE] wasn't masked → DONE_TAG fired → stream
+    # aborted → the closing ` never arrived. Mirror the unclosed-think
+    # / unclosed-fence fixes: walk the text, find any ` that isn't
+    # paired (next ` on the same line), mask from there to end-of-line
+    # (or end-of-text if no newline).
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == '`' and masked[i] == '`':  # not already masked
+            # Skip if this is part of a triple-fence already handled.
+            if i + 2 < n and text[i + 1] == '`' and text[i + 2] == '`':
+                i += 3
+                continue
+            # Find the next single ` on the same line.
+            j = i + 1
+            while j < n and text[j] != '`' and text[j] != '\n':
+                j += 1
+            if j < n and text[j] == '`':
+                # Found closing — regex above already handled it. Move past.
+                i = j + 1
+            else:
+                # Unclosed. Mask from i to end-of-line (or end-of-text).
+                _blank(i, j)
+                i = j
+        else:
+            i += 1
 
     # 3. Code-writing blocks — mask all forms where the model writes actual code.
     for pattern in (_EDIT_FILE_SPAN, _SEARCH_BLOCK, _REPLACE_BLOCK,
                     _INSERT_BLOCK, _EDIT_BLOCK_SPAN):
         for m in pattern.finditer(text):
             _blank(m.start(), m.end())
+
+    # 3b. Plan / plan-edit body spans — these are the planner's artifact.
+    # Signals (PLAN_DONE, STOP, DONE, CONTINUE) written INSIDE a
+    # `=== PLAN === ... === END PLAN ===` body are data, not commands —
+    # the model is documenting the protocol or quoting an example. The
+    # real signal lives AFTER `=== END PLAN ===`. Masking the body span
+    # prevents the documented-signal-fires-itself failure mode.
+    for pattern in (_PLAN_BLOCK_SPAN, _PLAN_EDIT_BLOCK_SPAN):
+        for m in pattern.finditer(text):
+            _blank(m.start(), m.end())
+
+    # 3c. UNCLOSED plan / plan-edit blocks — during streaming the closing
+    # `=== END PLAN ===` may not have arrived yet. Without this, the
+    # model could write a signal pair inside the still-open plan body
+    # and stop_check would fire mid-stream, aborting the plan before it
+    # completes. Same shape as the unclosed-think / unclosed-fence
+    # guards above. We use the LAST unclosed opener as the mask start.
+    for open_re, close_re in (
+        (_PLAN_OPEN, _PLAN_CLOSE),
+        (_PLAN_EDIT_OPEN, _PLAN_EDIT_CLOSE),
+    ):
+        opens = [m.start() for m in open_re.finditer(text)]
+        closes = [m.start() for m in close_re.finditer(text)]
+        if len(opens) > len(closes):
+            # The (len(closes))th open (0-indexed) is the first unclosed.
+            _blank(opens[len(closes)], len(text))
 
     # 4. Explicit escape: `\[TAG: ...]` → mask just the leading `[`
     for m in _BACKSLASH_BRACKET.finditer(text):
@@ -959,12 +1229,35 @@ def _run_code_reads(
                 )
                 continue
         else:
-            # Sandbox doesn't have the file at all. Fall back to project root
-            # — this is legitimate (sandbox lazy-loads files on first reference,
-            # so a file the workflow hasn't touched yet only lives at project_root).
-            full_path = os.path.join(project_root, fpath)
-            content = read_file(full_path)
-            source = "project"
+            # Sandbox doesn't have the file. Lazy-load it from project_root
+            # INTO the sandbox so subsequent rounds always read from the same
+            # path — previously we fell back to project_root inline, which
+            # meant R1 read from project, R2 from sandbox (if a later step
+            # copied it), and a transient path-resolution failure between
+            # those reads showed up as "FILE NOT FOUND" for a file that
+            # exists. Pulling into sandbox once keeps every subsequent read
+            # consistent.
+            project_path = os.path.join(project_root, fpath)
+            if os.path.isfile(project_path):
+                try:
+                    os.makedirs(os.path.dirname(sandbox_path), exist_ok=True)
+                    import shutil as _shutil
+                    _shutil.copy2(project_path, sandbox_path)
+                    sandbox_exists = True
+                    with open(sandbox_path, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                    source = "sandbox"
+                except Exception:
+                    # Copy failed (permissions, disk, etc.) — read project
+                    # directly so the round still produces useful content.
+                    content = read_file(project_path)
+                    source = "project"
+            else:
+                # File doesn't exist in either place — emit a focused FILE NOT
+                # FOUND with a list of similarly-named files so the model can
+                # fix the path instead of looping on a typo.
+                content = None
+                source = None
 
         # Empty-sandbox-file guard: a sandbox file that is exactly empty
         # almost always indicates a destructive edit (the model wrote a
@@ -1112,7 +1405,56 @@ def _run_code_reads(
                         f"{numbered}"
                     )
         else:
-            output_parts.append(f"\n=== Code: {fpath} — FILE NOT FOUND ===")
+            # File doesn't exist anywhere — show available files near that
+            # name so the model has a concrete next move instead of looping
+            # on the same wrong path. We search the SANDBOX (the canonical
+            # post-edit state) and, when sandbox has nothing yet, the
+            # project root.
+            suggestions: list[str] = []
+            try:
+                basename = os.path.basename(fpath).lower()
+                stem = basename.split('.')[0] if '.' in basename else basename
+                search_root = sandbox_dir if os.path.isdir(sandbox_dir) else project_root
+                # Walk once, cap to keep latency bounded on huge repos.
+                seen = 0
+                for dp, dirs, files in os.walk(search_root):
+                    # Skip common heavy dirs that never contain source.
+                    dirs[:] = [d for d in dirs if d not in (
+                        ".git", "__pycache__", "node_modules",
+                        ".venv", "venv", "dist", "build", ".jarvis_sandbox",
+                    )]
+                    for fn in files:
+                        seen += 1
+                        if seen > 5000:
+                            break
+                        if stem and stem in fn.lower():
+                            rel = os.path.relpath(os.path.join(dp, fn), search_root)
+                            suggestions.append(rel)
+                    if seen > 5000 or len(suggestions) >= 30:
+                        break
+                suggestions = sorted(set(suggestions))[:15]
+            except Exception:
+                suggestions = []
+
+            if suggestions:
+                sug_block = "\n".join(f"  • {s}" for s in suggestions)
+                output_parts.append(
+                    f"\n=== Code: {fpath} — FILE NOT FOUND ===\n"
+                    f"This path does not exist in the sandbox or the project root.\n"
+                    f"Files with a similar name (search root: "
+                    f"{'sandbox' if os.path.isdir(sandbox_dir) else 'project'}):\n"
+                    f"{sug_block}\n"
+                    f"Pick the actual path and re-issue [CODE: <path>] — do NOT\n"
+                    f"retry the same path; the file genuinely is not there."
+                )
+            else:
+                output_parts.append(
+                    f"\n=== Code: {fpath} — FILE NOT FOUND ===\n"
+                    f"This path does not exist in the sandbox or the project root,\n"
+                    f"and no file with a similar name was found. Check the path\n"
+                    f"against [PROJECT FILES] in the prompt — do NOT retry the\n"
+                    f"same path; the file genuinely is not there."
+                )
     return "\n".join(output_parts)
 
 
@@ -1863,6 +2205,7 @@ async def call_with_tools(
     on_stop: "Callable[[str], str | None] | None" = None,
     viewed_versions: "dict[str, str] | None" = None,
     stop_on_tool_block: bool = False,
+    cache_file_reads: bool = False,
 ) -> dict:
     """
     Call a model with mid-thought tool use.
@@ -1955,6 +2298,13 @@ async def call_with_tools(
 
     # Per-round response text — used to build tagged round history in prompt.
     _round_texts: list[str] = []  # _round_texts[i] = text produced in round i+1
+    # Round numbers (1-indexed) where the stream aborted on scaffold
+    # hallucination — i.e., the model started fabricating a fake
+    # `────── ROUND N — your tool result ──────` block inside its own
+    # response. The next round's prompt prepends a ⚠ notice to that
+    # round's tool-result section so the model sees: "you were inventing
+    # — here are the real results."
+    _hallucinated_rounds: set[int] = set()
 
     # ── PLAN state ───────────────────────────────────────────────────────
     # The planner can use === PLAN === / === PLAN_EDIT === blocks to draft
@@ -2057,6 +2407,21 @@ async def call_with_tools(
             stop_check=_stop_check,
             log_label=f"{log_label} — R{round_num}" if log_label else f"R{round_num}",
         )
+
+        # Apply [continue from: -N] backtrack directives BEFORE any other
+        # processing — every downstream consumer (signal detection,
+        # masking, plan extraction, tool extraction, edit extraction)
+        # should see the rewritten response, never the discarded content.
+        # The live stream log still shows the original (handy for
+        # debugging), but artifacts only carry the clean version.
+        _result_pre_backtrack = result
+        result = _apply_continue_from(result)
+        if result != _result_pre_backtrack:
+            status(
+                f"  [{model.split('/')[-1]}] round {round_num}: "
+                f"[continue from: -N] backtrack applied "
+                f"({len(_result_pre_backtrack):,} → {len(result):,} chars)"
+            )
 
         # ── Empty-response guard ─────────────────────────────────────
         # Some models return an empty string under load (no reasoning, no
@@ -2217,60 +2582,6 @@ async def call_with_tools(
                 f"— model forgot [/tool use]"
             )
 
-        # ── Prompt-leak guard: trim hallucinated JARVIS scaffolding ────
-        # When a model starts emitting tokens that ONLY ever appear in
-        # our bridge prompt (e.g. "TOOL RESULTS (cumulative", "[← CODE:")
-        # it has lost track of what's input vs output and the rest of
-        # the response is unreliable. Cut at the first such marker — the
-        # text before it is still real model output that we can use.
-        # Observed in practice: kimi-k2.6 emitted the full TOOL RESULTS
-        # banner and 400+ duplicate code lines AFTER its real reply.
-        # Phrases that ONLY appear in the continuation prompt's
-        # scaffolding. We trim the response at the EARLIEST leak so
-        # hallucinated prompt-templates downstream get cut too.
-        _PROMPT_LEAK_MARKERS = (
-            # New unified [...] section labels:
-            "[YOUR TOOL INDEX]",
-            "[YOUR PAST THINKING]",
-            "[YOUR PLAN]",
-            "[YOUR TOOL RESULTS]",   # legacy still possible to leak
-            "[YOUR PRIOR TURNS]",    # legacy still possible to leak
-            "[WRITE YOUR NEXT TURN BELOW]",
-            "[PROJECT CONTEXT]",
-            "[INPUT PLANS]",
-            "[END INPUT PLANS]",
-            "[INPUT PLAN #",
-            "────── ROUND",
-            # Legacy banners:
-            "TOOL RESULTS (cumulative across all tool calls",
-            "══ CONTEXT MANIFEST — what you have actually read",
-            "TOOL CALLS THAT DID NOT FIRE",
-            "BUDGET OVERFLOW — these results were DROPPED",
-            "EDIT APPLICATION RESULTS — what the runtime did",
-            "UNTERMINATED EDIT BLOCK(S)",
-            "YOUR THINKING SO FAR — continuous reasoning",
-            "YOUR PREVIOUS TURNS — DONE, not unfinished",
-            "YOUR WORK SO FAR (continuous — keep writing from where",
-            "↓ Continue your thinking",
-            "↓ Continue writing from where you stopped",
-            "↓ NOW WRITE YOUR NEXT TURN",
-            "\n[← CODE:", "\n[← KEEP:", "\n[← VIEW:",
-            "\n[← REFS:", "\n[← SEARCH:",
-        )
-        _earliest_leak = -1
-        for _marker in _PROMPT_LEAK_MARKERS:
-            _pos = result.find(_marker)
-            if _pos >= 0 and (_earliest_leak < 0 or _pos < _earliest_leak):
-                _earliest_leak = _pos
-        if _earliest_leak >= 0:
-            n_dropped = len(result) - _earliest_leak
-            result = result[:_earliest_leak].rstrip()
-            warn(
-                f"  [{model.split('/')[-1]}] round {round_num}: "
-                f"prompt-leak detected — trimmed {n_dropped:,} chars of "
-                f"hallucinated scaffolding"
-            )
-
         # ── Near-verbatim response loop detector ─────────────────────────
         # Run AFTER all post-processing (signal strip, auto-close, leak
         # trim) so we compare apples-to-apples against the same form that
@@ -2305,6 +2616,27 @@ async def call_with_tools(
             # don't re-run identical tool calls (pure waste), break out.
             break
 
+        # ── Scaffold-hallucination trim ──────────────────────────────────
+        # If the model wrote `────── ROUND` inside its response, it was
+        # fabricating a fake tool-result section. The stream guard already
+        # aborted, but the partial text up to (and possibly including) the
+        # scaffold marker is still in `result`. Trim from the marker
+        # onward — the model's real reasoning + tool calls before that
+        # point are KEPT (so the tools fire normally based on placement);
+        # only the invented content is dropped. Flag the round so the
+        # next prompt prepends a targeted notice in this round's tool
+        # result section.
+        _hallu_idx = result.find("────── ROUND")
+        if _hallu_idx >= 0:
+            _hallucinated_rounds.add(round_num)
+            n_trimmed = len(result) - _hallu_idx
+            result = result[:_hallu_idx].rstrip()
+            warn(
+                f"  [{model.split('/')[-1]}] round {round_num}: "
+                f"scaffold-hallucination — trimmed {n_trimmed:,} chars of "
+                f"fabricated tool-result content"
+            )
+
         _round_texts.append(result)
 
         # ── Process PLAN / PLAN_EDIT blocks ───────────────────────────────
@@ -2331,7 +2663,7 @@ async def call_with_tools(
         _plan_ops_with_pos.sort(key=lambda t: t[0])
         for _pos, _kind, _body in _plan_ops_with_pos:
             if _kind == "write":
-                current_plan = _body.rstrip()
+                current_plan = _strip_think(_body).rstrip()
                 plan_version += 1
                 _line_count = current_plan.count('\n') + 1 if current_plan else 0
                 _plan_op_log.append(
@@ -2345,7 +2677,7 @@ async def call_with_tools(
                         "Use === PLAN === first to create the plan."
                     )
                     continue
-                _new_plan, _edit_logs = _apply_plan_edits(current_plan, _body)
+                _new_plan, _edit_logs = _apply_plan_edits(current_plan, _strip_think(_body))
                 if _new_plan != current_plan:
                     current_plan = _new_plan
                     plan_version += 1
@@ -2361,24 +2693,90 @@ async def call_with_tools(
 
         # ── PLAN DONE: finalize and return the plan as the answer ─────────
         # Two-tag signal mirroring [STOP][CONFIRM_STOP] / [DONE][CONFIRM_DONE].
-        # When fires, the runtime returns `current_plan` as the planner's
-        # final answer and breaks out of the loop.
-        if PLAN_DONE_TAG.search(result):
+        # When fires, the runtime returns the planner's final answer and
+        # breaks out of the loop.
+        #   • Preferred path: model used === PLAN === to build `current_plan`
+        #     incrementally → use that as the answer.
+        #   • Backward-compat path: model wrote a plan in raw prose (## GOAL,
+        #     ## REQUIREMENTS, etc.) WITHOUT the === PLAN === wrapper, then
+        #     ended with [PLAN DONE][CONFIRM_PLAN_DONE]. Observed in qwen-3.5:
+        #     wrote a full plan + [PLAN DONE], but `current_plan` was empty
+        #     so the prior runtime just warned and continued — qwen's plan
+        #     was silently discarded and the next round began. Now we fall
+        #     back to using the model's current-round response as the answer.
+        # In both cases: strip the [PLAN DONE]/[CONFIRM_PLAN_DONE]/[STOP]/
+        # [CONFIRM_STOP] tags from the answer so they don't leak downstream.
+        # ── PLAN_DONE detection: masking + context validation ─────────────
+        # Two-layer filter so only a *genuine* terminal PLAN_DONE fires:
+        #
+        #   Layer A (mask): a pair written INSIDE a code fence, [think]
+        #     block, `=== PLAN === ... === END PLAN ===` body, edit body,
+        #     etc. is data, not a signal. _mask_for_signals blanks the
+        #     leading `[` of those instances so the regex can't match.
+        #
+        #   Layer B (context): of the candidates that survive masking,
+        #     only those that follow a recognized "I just finished a plan"
+        #     marker count. See _plan_done_context_kind for the list:
+        #       - `=== END PLAN ===` in the last 2000 chars
+        #       - `## VERIFICATION` / `## CONFIDENCE GATE` / etc. in 2000
+        #       - closed [/think] or </think> in the last 800 chars
+        #
+        # If at least one candidate is in a valid context, the LAST such
+        # one fires (terminal signals are by nature near EOF, and writing
+        # multiple PLAN_DONE pairs is itself a protocol error — we honor
+        # the final one so the model can't accidentally commit twice).
+        #
+        # If candidates exist but NONE are in a valid context, the model
+        # likely emitted PLAN_DONE mid-investigation or while writing
+        # prose that documented the protocol. We fall through to the
+        # "rejected PLAN_DONE" branch below, which surfaces a structured
+        # correction next round.
+        _signal_masked = _mask_for_signals(result)
+        _pd_matches = list(PLAN_DONE_TAG.finditer(_signal_masked))
+        _pd_valid: list[tuple[int, str]] = []
+        for _m in _pd_matches:
+            kind = _plan_done_context_kind(result, _m.start())
+            if kind is not None:
+                _pd_valid.append((_m.start(), kind))
+
+        if _pd_valid:
+            _signal_pos, _ctx_kind = _pd_valid[-1]
             if current_plan:
-                status(
-                    f"  [{model.split('/')[-1]}] round {round_num}: "
-                    f"[PLAN DONE] — finalizing plan (v{plan_version}, "
-                    f"{current_plan.count(chr(10)) + 1} lines)"
-                )
-                full_response = current_plan
-                _done_signaled = True
-                break
+                _answer = current_plan
+                _src = f"=== PLAN === (v{plan_version}, {current_plan.count(chr(10)) + 1} lines)"
             else:
+                # Backward-compat: use the raw response as the plan.
+                _answer = _strip_think(result)
+                for _tag in (PLAN_DONE_TAG, STOP_TAG, DONE_TAG, CONTINUE_TAG):
+                    _answer = _tag.sub('', _answer)
+                # Strip stray half-signals too (model may have written
+                # [PLAN DONE] alone if half-arrived during streaming).
+                _answer = re.sub(
+                    r'\[(?:PLAN\s+DONE|CONFIRM_PLAN_DONE|STOP|CONFIRM_STOP|'
+                    r'DONE|CONFIRM_DONE|CONTINUE|CONFIRM_CONTINUE)\]',
+                    '', _answer, flags=re.IGNORECASE,
+                ).strip()
+                _src = "raw-prose plan (no === PLAN === block used)"
                 warn(
                     f"  [{model.split('/')[-1]}] round {round_num}: "
-                    f"[PLAN DONE] fired but no plan content exists. "
-                    f"Use === PLAN === to write the plan first."
+                    f"[PLAN DONE] with empty === PLAN === — falling back "
+                    f"to raw-prose response ({len(_answer):,} chars)"
                 )
+            status(
+                f"  [{model.split('/')[-1]}] round {round_num}: "
+                f"[PLAN DONE] in context '{_ctx_kind}' — "
+                f"finalizing plan from {_src}"
+            )
+            full_response = _answer
+            _done_signaled = True
+            break
+
+        # PLAN_DONE pair written but NOT in a valid context — reject it
+        # and queue a structured correction for the next round. Mirrors
+        # the bare-signal correction path below; we set a flag here and
+        # the injection happens in the same block (so we never double-
+        # inject when both conditions are true on the same round).
+        _suspected_invalid_plan_done = bool(_pd_matches) and not _pd_valid
 
         # ── Capture which preamble sections were written in round 1 ──────
         # Once round 1 finishes, scan _round_texts[0] for the section
@@ -2534,6 +2932,63 @@ async def call_with_tools(
                 "treated as plain text and the loop continues.]\n\n"
                 "Continue your response with the correct two-tag signal "
                 "if that's what you meant.\n"
+            )
+            current_prompt = (
+                current_prompt + "\n\nASSISTANT: " + full_response + correction
+            )
+            full_response = ""
+            continue
+
+        # ── PLAN_DONE rejected (invalid context) ─────────────────────
+        # Model emitted [PLAN DONE][CONFIRM_PLAN_DONE] but it didn't
+        # follow any recognized termination marker. The signal was
+        # *intentional* (both halves present, both unmasked), just
+        # placed wrong. Tell the model what we expected so it can
+        # correct itself in the next round. Skip the injection when
+        # real tool tags ARE present — the round is doing work and
+        # the lookups will themselves push the model toward the
+        # canonical terminal section.
+        if _suspected_invalid_plan_done and not has_tags:
+            warn(
+                f"  [{model.split('/')[-1]}] round {round_num}: "
+                f"[PLAN DONE][CONFIRM_PLAN_DONE] rejected — not in a "
+                f"recognized termination context. Injecting protocol "
+                f"reminder."
+            )
+            full_response += result
+            correction = (
+                "\n\n[SYSTEM NOTE: You emitted [PLAN DONE][CONFIRM_PLAN_DONE] "
+                "but the runtime REJECTED it — the signal was not in a "
+                "valid termination context, so the plan was NOT finalized "
+                "and the loop continues.\n\n"
+                "PLAN_DONE only fires when it appears in one of these "
+                "structural positions:\n"
+                "  1. AFTER `=== END PLAN ===` — your final `=== PLAN ===` "
+                "block was properly closed and the signal terminates it.\n"
+                "  2. AFTER a canonical terminal section header — one of "
+                "`## VERIFICATION`, `## CONFIDENCE GATE`, "
+                "`## PRE-MORTEM RESOLUTION`, `## TEST CRITERIA`, "
+                "`## FINAL NOTES`, or `## SUMMARY`. Write this section "
+                "as the last part of your plan; the runtime treats it as "
+                "the conventional 'I'm done' marker.\n"
+                "  3. AFTER a closed `[think]...[/think]` or "
+                "`<think>...</think>` block — reserved for the case where "
+                "you have genuine reason to commit early (e.g. the user's "
+                "task is a trivial fix that doesn't warrant a ## VERIFICATION "
+                "section). The [think] block must explain WHY ending early "
+                "is correct.\n\n"
+                "What to do next:\n"
+                "  • Normal case: write the canonical terminal section "
+                "(## VERIFICATION) describing how the user will observe the "
+                "change working, then re-issue [PLAN DONE][CONFIRM_PLAN_DONE] "
+                "on its own at the end of your response.\n"
+                "  • Early-commit case: open a [think]...[/think] block "
+                "explaining why the canonical section doesn't apply, then "
+                "re-issue [PLAN DONE][CONFIRM_PLAN_DONE] immediately after "
+                "the closing [/think].\n\n"
+                "Your plan and any progress so far are preserved in YOUR "
+                "PLAN / YOUR PAST THINKING above — no work was lost. "
+                "Continue from where you left off.]\n"
             )
             current_prompt = (
                 current_prompt + "\n\nASSISTANT: " + full_response + correction
@@ -2837,8 +3292,17 @@ async def call_with_tools(
         # it has seen content it never actually requested.
         def _cached_or_run(tag_type: str, tags: list[str]) -> tuple[list[str], str]:
             """Returns (new_tags_to_run, cached_output_for_already_run_tags).
-            CODE and KEEP always re-run — file content may have changed."""
-            if tag_type in ("CODE", "KEEP"):
+
+            CODE and KEEP normally re-run because the file may have been
+            edited mid-conversation (coder paths). When `cache_file_reads`
+            is True (planner / reviewer paths that don't write edits) we
+            also cache CODE/KEEP — re-asking for the same path returns the
+            stored content with a notice instead of burning a tool round.
+            This was the #1 source of planners exhausting their budget:
+            kimi-k2.6 re-issued [CODE: separable.py] in R1, R2, R7 because
+            the runtime kept obliging.
+            """
+            if tag_type in ("CODE", "KEEP") and not cache_file_reads:
                 return tags, ""
             cached_out = ""
             new_tags = []
@@ -3431,15 +3895,33 @@ async def call_with_tools(
             for _i, _text in enumerate(_round_texts):
                 _rn = _i + 1
                 _past_thinking_parts.append(
-                    f"────── ROUND {_rn} ──── what you thought ──────"
+                    f"────── ROUND {_rn} — your thinking ──────"
                 )
                 _past_thinking_parts.append(_text.rstrip())
                 _round_entries = _by_round.get(_rn, [])
                 if _round_entries:
                     _past_thinking_parts.append("")
                     _past_thinking_parts.append(
-                        f"────── ROUND {_rn} ──── what your tools returned ──────"
+                        f"────── ROUND {_rn} — your tool result ──────"
                     )
+                    # Targeted hallucination notice — if the round's
+                    # stream aborted because the model started faking a
+                    # tool result, tell the model right here, attached to
+                    # this round's results, that what they imagined is
+                    # NOT what's below. Avoids both the model trusting
+                    # its own fabrication AND repeating it next round.
+                    if _rn in _hallucinated_rounds:
+                        _past_thinking_parts.append(
+                            "⚠ In your previous response you started "
+                            "writing a fake `────── ROUND N — your tool "
+                            "result ──────` block and inventing content "
+                            "after it. The runtime aborted that stream. "
+                            "What you imagined is GONE. The REAL results "
+                            "from the tools you actually called are listed "
+                            "below — quote and reason from these, not "
+                            "from whatever you started to fabricate."
+                        )
+                        _past_thinking_parts.append("")
                     for _k, _info in _round_entries:
                         _tt = _info["tag_type"]
                         _arg = _info["arg"]
@@ -3453,11 +3935,26 @@ async def call_with_tools(
                             f"\n[{_tt}: {_arg}]{_flag}\n{_content}"
                         )
                 else:
-                    _past_thinking_parts.append(
-                        "\n(no tool results from this round — either no tools "
-                        "fired, or all results were dropped for budget; see "
-                        "[BUDGET OVERFLOW] above if shown)"
-                    )
+                    if _rn in _hallucinated_rounds:
+                        _past_thinking_parts.append("")
+                        _past_thinking_parts.append(
+                            f"────── ROUND {_rn} — your tool result ──────"
+                        )
+                        _past_thinking_parts.append(
+                            "⚠ Your stream aborted because you began "
+                            "fabricating a fake tool-result block. No "
+                            "real tools fired in this round (or all "
+                            "were dropped). Don't reason from your "
+                            "imagined results — make NEW tool calls if "
+                            "you still need the info."
+                        )
+                    else:
+                        _past_thinking_parts.append(
+                            "\n(no tool results from this round — either "
+                            "no tools fired, or all results were dropped "
+                            "for budget; see [BUDGET OVERFLOW] above if "
+                            "shown)"
+                        )
                 _past_thinking_parts.append("")  # blank line between rounds
 
         past_thinking = "\n".join(_past_thinking_parts).rstrip()
@@ -3497,28 +3994,45 @@ async def call_with_tools(
         else:
             plan_section = ""
 
-        # Build continuation prompt — include explicit round budget so the
-        # model feels time pressure to commit instead of looping. After the
-        # halfway mark we escalate: "wrap up". Past the threshold, we say
-        # "STOP investigating, COMMIT NOW".
+        # Build continuation prompt — escalating budget pressure that
+        # tells the model to commit a DRAFT plan, not just "wrap up
+        # investigation." Models read "commit" as "lock in your approach
+        # in prose" rather than "write === PLAN ===" — so the cue is
+        # explicit about the action. Past halfway: start the draft.
+        # Past 2/3: stop investigating, draft now (refine later via
+        # === PLAN_EDIT ===). Past budget: no more tools, period.
+        #
+        # Observed (20260513_131849 minimax-m2.7): the model wrote 6
+        # rounds of "## ORIENT (updated after RN results)" refining its
+        # approach in prose, never emitted === PLAN ===, then in R6
+        # degenerated into empty `[tool use]…[/tool use]` blocks. The
+        # weaker prior wording let "commit" mean anything.
         budget_msg = ""
         rounds_used = round_num
         rounds_left = max_rounds - rounds_used
         if rounds_left <= 0:
             budget_msg = (
-                "\n⛔ NO TOOL ROUNDS LEFT. This is your FINAL response. "
-                "Write your plan/edits NOW. Do NOT use any more tool tags."
+                f"\n⛔ Round {rounds_used}/{max_rounds} — NO ROUNDS LEFT. This is your "
+                "FINAL response. Write your COMPLETE plan inside `=== PLAN === ... "
+                "=== END PLAN ===` THEN `[PLAN DONE][CONFIRM_PLAN_DONE]`. Do NOT "
+                "use any more tool tags."
             )
         elif rounds_used >= max(3, max_rounds * 2 // 3):
             budget_msg = (
-                f"\n⚠ Round {rounds_used}/{max_rounds}. {rounds_left} round(s) left. "
-                "Wrap up investigation and commit to your answer. Use tools ONLY if "
-                "absolutely required to fill a remaining gap."
+                f"\n⛔ Round {rounds_used}/{max_rounds} — {rounds_left} round(s) left. "
+                "STOP INVESTIGATING. Write your `=== PLAN === ... === END PLAN ===` "
+                "block this round — even if not perfect, you can refine with "
+                "`=== PLAN_EDIT ===` later. Tool calls only for one SPECIFIC "
+                "remaining gap (and only if naming it as one question)."
             )
         elif rounds_used >= max(2, max_rounds // 2):
             budget_msg = (
-                f"\n• Round {rounds_used}/{max_rounds}. You have {rounds_left} round(s) left. "
-                "Prefer committing over more investigation when in doubt."
+                f"\n⚠ Round {rounds_used}/{max_rounds} — past halfway, {rounds_left} "
+                "round(s) left. START YOUR DRAFT PLAN NOW: open "
+                "`=== PLAN === ... === END PLAN ===` and write what you have so far, "
+                "even if incomplete. Refine in later rounds with `=== PLAN_EDIT ===` "
+                "or with one more focused tool call. Refining a draft beats "
+                "polishing your approach in prose."
             )
 
         # ── Build context manifest ────────────────────────────────────
@@ -3756,23 +4270,30 @@ async def call_with_tools(
         # to "I haven't seen the result yet" re-issues. With results
         # FIRST, the model reads them as context, then reads its own
         # work, then continues writing — natural flow, no back-tracking.
-        # Continuation prompt — every section is clearly labelled and has
-        # ONE owner. The model never has to guess "is this for me to do, or
-        # is this what I already did?". The [SYSTEM] block (in `prompt`)
-        # gives WORKFLOW + HOW TO THINK. The [USER REQUEST] gives the GOAL.
-        # [YOUR PAST THINKING] is the model's own chronological history —
-        # round by round, each round showing "what you thought" then
-        # "what your tools returned". That ordering matches the actual
-        # temporal flow: you wrote tool calls, then results came back,
-        # then you wrote more, then more results came back, etc.
+        # Continuation prompt — order matters for PREFIX CACHING.
         #
-        # [WRITE YOUR NEXT TURN BELOW] is the bottom marker — the model
-        # writes its NEXT response below it. The cue avoids any reference
-        # to the prior `[tool use]` block (which earlier framings caused
-        # models to pattern-complete by emitting the same shape again).
-        current_prompt = f"""{unterminated_block}{_budget_drop_block}{dropped_block}{edit_results_block}{prompt}
+        # The {prompt} block (= [SYSTEM] + [USER REQUEST] + [PROJECT
+        # CONTEXT]) is STABLE across rounds for a given task. Putting it
+        # FIRST means the token prefix is identical on every round; vLLM
+        # (which NVIDIA NIM uses under the hood) caches the KV for that
+        # prefix automatically. Round 2's prefill skips most of the work
+        # Round 1 already did. The 4 parallel planners on the same host
+        # also share the cache.
+        #
+        # Anything that CHANGES between rounds (per-round warning banners,
+        # tool index, past thinking, plan section, the next-turn cue) goes
+        # AFTER the stable prefix. Earlier the warning banners were
+        # PREPENDED to {prompt}, which killed every cache hit: even a
+        # single-round "BUDGET OVERFLOW" appearance shifted every later
+        # token. Now those banners attach AFTER the stable block.
+        #
+        # Section ownership (already covered in [SYSTEM]'s PROMPT
+        # STRUCTURE explainer): [SYSTEM]/[USER REQUEST]/[PROJECT CONTEXT]
+        # = JARVIS or HUMAN; [YOUR ...] sections = YOU; [WRITE YOUR NEXT
+        # TURN BELOW] is where the new response goes.
+        current_prompt = f"""{prompt}
 
-══════════════════════════════════════════════════════════════════════
+{unterminated_block}{_budget_drop_block}{dropped_block}{edit_results_block}══════════════════════════════════════════════════════════════════════
 [YOUR TOOL INDEX] — every tool call you've made so far
 ══════════════════════════════════════════════════════════════════════
 {manifest_str}
@@ -3781,9 +4302,9 @@ async def call_with_tools(
 ══════════════════════════════════════════════════════════════════════
 [YOUR PAST THINKING] — your previous rounds, oldest first
 ══════════════════════════════════════════════════════════════════════
-Your own past work, in order. Each round shows what YOU thought
-(prose + tool calls) and what your TOOLS returned for those calls.
-Build on it. Do not repeat it.
+Your own past work, in order. Each round shows YOUR THINKING (prose
++ tool calls you made) and the TOOL RESULT (the content the runtime
+returned for those calls). Build on it. Do not repeat it.
 
 {past_thinking}
 {plan_section}

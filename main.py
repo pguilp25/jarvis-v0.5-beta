@@ -200,17 +200,25 @@ def _extract_notes(answer: str) -> tuple[str, str]:
 
 
 def _extract_thinking(text: str) -> tuple[str, str]:
-    """Extract <think>...</think> blocks from response text.
+    """Extract <think>...</think> AND [think]...[/think] blocks from response.
     Returns (clean_text, thinking_trace).
+
+    <think> is what the streaming clients wrap reasoning_content in.
+    [think] is the bracketed equivalent a model can emit directly when its
+    reasoning channel isn't surfaced or isn't preserved across rounds.
     """
     import re
-    thinking_parts = []
-    # Match <think>...</think> blocks (the streaming clients use these markers)
-    pattern = r'<think>(.*?)</think>'
-    matches = re.findall(pattern, text, re.DOTALL)
+    # Capture the inner text of either form. The outer group selects which
+    # delimiter was used; the inner alternation captures the content.
+    pattern = r'(?:<think>(.*?)</think>|\[think\](.*?)\[/think\])'
+    matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
     if matches:
-        thinking_parts = [m.strip() for m in matches if m.strip()]
-        clean = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+        thinking_parts = []
+        for ang, brk in matches:
+            piece = (ang or brk).strip()
+            if piece:
+                thinking_parts.append(piece)
+        clean = re.sub(pattern, '', text, flags=re.DOTALL | re.IGNORECASE).strip()
         return clean, "\n\n".join(thinking_parts)
     return text, ""
 
@@ -551,7 +559,7 @@ async def main():
         if settings_file.exists():
             saved = json.loads(settings_file.read_text(encoding="utf-8"))
             loaded = []
-            for key in ["NVIDIA_API_KEY", "GEMINI_API_KEY", "GEMINI_API_KEYS", "GROQ_API_KEY", "OPENROUTER_API_KEY"]:
+            for key in ["NVIDIA_API_KEY", "LIGHTNING_API_KEY", "DEEPINFRA_API_KEY", "GEMINI_API_KEY", "GEMINI_API_KEYS", "GROQ_API_KEY", "OPENROUTER_API_KEY"]:
                 val = saved.get(key, "")
                 if val and not os.environ.get(key):
                     os.environ[key] = val

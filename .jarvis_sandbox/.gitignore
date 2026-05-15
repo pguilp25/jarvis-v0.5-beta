@@ -8,6 +8,4 @@ venv.zip
 jarvis-v5-complete.tar.gz
 /backup_v4_20260324_085854-3
 .jarvis/
-.jarvis_sandbox/predictions*.jsonl
-*.swebench_work*
-
+.jarvis_sandbox/

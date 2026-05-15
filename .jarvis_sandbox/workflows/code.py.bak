@@ -1,0 +1,2290 @@
+"""
+Coding Agent -- JARVIS v0.5.1
+
+Workflow:
+  Phase 2 -- PLAN:
+    Standard (complexity < 7):
+      Layer 1: 4 AIs write independent plans (parallel)
+      Layer 2: GLM-5 picks the best plan and improves it
+    Deep (complexity >= 7 or !!deepcode):
+      Layer 1: 4 AIs write independent plans (parallel)
+      Layer 2: 4 AIs each pick the best plan, improve it (parallel)
+      Layer 3: GLM-5 picks the best improved plan, improves it one final time
+  Phase 3 -- IMPLEMENT: ONE GLM-5 coder, ONE call. The plan's steps become
+               the AI's chain of thought — it works through step 1, writes
+               edits, then step 2 using step 1's code, etc. All in one call.
+  Phase 3.5 -- REVIEW: ONE GLM-5 reviewer sees ALL changed files together,
+               verifies cross-file integration, uses [REFS:]/[LSP:] to check
+               dependencies, fixes issues.
+  Phase 4 -- TEST: optional (only if user asks)
+  Phase 5 -- DELIVER: show diff, ask to apply
+
+Research sharing: all tool lookups (REFS, LSP, SEARCH, CODE, etc.) are
+cached in a shared research_cache dict. Results from planners are
+pre-injected into coder/reviewer prompts so they don't re-search.
+Parallel lookups are deduplicated with per-key asyncio locks.
+
+Syntax checking: coder output is syntax-checked (Python compile, Node
+--check, JSON parse, HTML tag balance, CSS brace balance). Errors are
+fixed in-place by a focused SYNTAX_FIX_PROMPT — code is NOT rolled back.
+Same syntax-fix loop applies to reviewer fixes.
+"""
+
+import asyncio
+import os
+import re
+import subprocess
+from core.retry import call_with_retry
+from core.tool_call import call_with_tools as _call_with_tools
+from core.state import AgentState
+from core.cli import step, status, success, warn, error
+from core.system_knowledge import SYSTEM_KNOWLEDGE
+from clients.gemini import call_flash
+from tools.codebase import (
+    scan_project, read_file, read_files, search_code,
+    format_search_results, run_on_demand_searches,
+    extract_search_requests, add_line_numbers, extract_relevant_sections,
+)
+from tools.sandbox import Sandbox
+
+
+# ─── Models ──────────────────────────────────────────────────────────────────
+
+UNDERSTAND_MODELS = [
+    "nvidia/deepseek-v3.2",
+    "nvidia/qwen-3.5",
+    "nvidia/minimax-m2.5",
+]
+
+IMPLEMENT_MODEL = "nvidia/glm-5"
+
+NVIDIA_5 = [
+    "nvidia/deepseek-v3.2",
+    "nvidia/glm-5",
+    "nvidia/minimax-m2.5",
+    "nvidia/qwen-3.5",
+    "nvidia/nemotron-super",
+]
+
+NVIDIA_3 = [
+    "nvidia/deepseek-v3.2",
+    "nvidia/qwen-3.5",
+    "nvidia/minimax-m2.5",
+]
+
+
+# ─── Prompts ─────────────────────────────────────────────────────────────────
+
+from core.agent_context import get_agent_context as _get_agent_context
+
+UNDERSTAND_PROMPT = _get_agent_context("code") + "\n\n" + SYSTEM_KNOWLEDGE + """
+
+You are a code analyst. Your job: find ALL relevant code for this task.
+
+CONTEXT IS CRITICAL:
+If the task is ambiguous or references something from conversation ("fix that bug",
+"add the feature we discussed", "do the same for X"), use the conversation context
+to understand what the user actually wants. Do NOT guess — look at what was discussed.
+
+TASK: {task}
+
+PROJECT STRUCTURE:
+{project_structure}
+
+YOUR JOB:
+1. Restate what the user wants in your own words
+2. Look at the project structure — which files are relevant?
+3. Search for the specific code you need to understand — escalate in order:
+   [REFS: name]           — find definitions, imports, usages (start here)
+   [LSP: name]            — semantic deps, types (if REFS not enough)
+   [SEARCH: pattern]      — ripgrep pattern search
+   Write only the tags you need, then STOP. No duplicates.
+
+Output:
+## RELEVANT FILES
+- path/to/file.py — why it's relevant
+
+## SEARCH REQUESTS
+[REFS: the_key_function]
+
+## KEY CODE SECTIONS
+- function_name in file.py — what it does, why it matters
+
+## TASK CLASSIFICATION
+- bug fix / new feature / refactor / optimization
+- estimated complexity: simple / medium / complex
+"""
+
+PLAN_COT_EXISTING = """
+══════════════════════════════════════════════════════════════════════
+YOUR CHAIN OF THOUGHT — EXPAND LEVEL BY LEVEL
+══════════════════════════════════════════════════════════════════════
+
+You MUST think by EXPANDING, level by level. Never jump ahead.
+At each level, check: do I need to zoom in further? Use tools to expand.
+
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 1 — UNDERSTAND THE TASK                                   │
+└─────────────────────────────────────────────────────────────────┘
+
+Read the TASK and the PROJECT OVERVIEW above.
+
+Write your thinking:
+  - What is the user asking for? Restate in your own words.
+  - Separate CONTEXT (what exists now) from INSTRUCTIONS (what to change).
+  - Which files does this touch?
+  - What do I still need to look up?
+
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 2 — READ THE ACTUAL CODE                                  │
+└─────────────────────────────────────────────────────────────────┘
+
+Before planning, you MUST understand how the existing code works.
+Use [CODE: path/file] to read the files you will modify.
+
+For each file, write:
+  - "This file does X. The function Y works by doing Z."
+  - "Data flows: A calls B which returns C, then C is passed to D."
+  - "The key mechanism is: [how it works — callbacks, events, returns, etc.]"
+
+This is critical. If you plan changes that conflict with HOW the code
+works (e.g. treating a callback as a return value, or adding to a list
+that is actually a dict), the code will break.
+
+  [CODE: path/file]
+  [REFS: function_name]
+  STOP
+
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 3 — WRITE THE PLAN                                        │
+└─────────────────────────────────────────────────────────────────┘
+
+Write the plan using the format below.
+Your plan must work with HOW the existing code is structured:
+  - If the code uses callbacks, your changes must use callbacks
+  - If a function returns X, your code must handle X
+  - If data is stored as Y, your code must work with Y
+  - If the code uses async/await, your changes must too
+
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 4 — VERIFY YOUR PLAN AGAINST THE CODE                     │
+└─────────────────────────────────────────────────────────────────┘
+
+BEFORE finishing, mentally trace through your plan:
+  "After my changes, when the user does X, the code will:
+   1. Call function A (unchanged)
+   2. A calls my new function B with [these params]
+   3. B does [this] and returns [that]
+   4. A uses the return value to [do this]
+   5. ..."
+
+Check:
+  - Does every function call match the actual signature?
+  - Does the data type match what the receiving code expects?
+  - Are async/sync patterns correct? (no await on non-async, etc.)
+  - Will imports resolve? Does the module path exist?
+
+If anything doesn't work, fix your plan now.
+
+══════════════════════════════════════════════════════════════════════
+"""
+
+PLAN_COT_NEW = """
+══════════════════════════════════════════════════════════════════════
+YOUR CHAIN OF THOUGHT — EXPAND LEVEL BY LEVEL
+══════════════════════════════════════════════════════════════════════
+
+This is a NEW project — there is no existing code. Do NOT use [DETAIL:],
+[CODE:], or [SEARCH:] tags — there is nothing to look up.
+
+You MUST think by EXPANDING, level by level. Never jump ahead.
+
+┌─────────────────────────────────────────────────────────────────┐
+│  LEVEL 1 — GENERAL ARCHITECTURE                                │
+└─────────────────────────────────────────────────────────────────┘
+
+What is the big picture? Write your thinking:
+  - What is the user asking for? Restate in your own words.
+  - What files/modules will this project have?
+  - How do they connect? What is the data flow between them?
+  - What is the user-facing behavior at a high level?
+
+Do NOT go into detail yet. Just the skeleton.
+
+┌─────────────────────────────────────────────────────────────────┐
+│  LEVEL 2 — EXPAND EACH SECTION INTO DETAIL                     │
+└─────────────────────────────────────────────────────────────────┘
+
+Now take EACH file/module from Level 1 and expand it:
+  - What functions/classes does it contain?
+  - What data structures and state does it manage?
+  - What is the exact behavior of each function? (inputs, outputs, logic)
+  - What edge cases exist?
+  - How does it interact with the other modules?
+
+Go through every section. Do not skip any.
+
+┌─────────────────────────────────────────────────────────────────┐
+│  LEVEL 3 — WRITE THE PLAN                                      │
+└─────────────────────────────────────────────────────────────────┘
+
+Now that you have expanded everything, write the final plan using the
+format below. The plan should be detailed enough that a developer can
+implement each file without asking questions.
+
+You can use [WEBSEARCH: query] if you need to look up an API, library,
+or technique you're not sure about.
+
+══════════════════════════════════════════════════════════════════════
+"""
+
+PLAN_PROMPT = SYSTEM_KNOWLEDGE + """
+
+══════════════════════════════════════════════════════════════════════
+YOUR ROLE: PLANNER
+══════════════════════════════════════════════════════════════════════
+You are a software architect. Your ONLY job is to write an implementation plan.
+
+WHY YOU EXIST: You are one of several AIs writing independent plans.
+After you finish, your plan will be compared against other plans by another
+set of AIs who will find flaws, pick the best ideas, and merge everything
+into one final plan. That final plan gets handed to a SEPARATE coding AI
+(GLM-5) that implements it. If your plan is vague, the coder will guess
+wrong. If your plan has logic errors, the reviewer might miss them.
+BE PRECISE. BE EXPLICIT. Cover edge cases.
+
+YOU DO:
+  - Analyze the task and the codebase
+  - Design the solution — what to change, where, and how the logic works
+  - Describe behavior, data flow, edge cases in plain English
+  - Use tools to understand the existing code before planning
+
+YOU DO NOT:
+  - Write ANY code — no snippets, no pseudo-code, no function calls
+  - Implement anything — that is a different AI's job
+
+TOOLS — use in this order, escalate only if you need more info:
+  1. [REFS: name]           — find all definitions, imports, usages (fast, ripgrep)
+  2. [LSP: name]            — semantic search: dependencies, types, indirect refs
+                              (only if REFS didn't give enough)
+  3. [DETAIL: section name] — organized code map for a feature
+     [PURPOSE: category]    — all code serving a purpose (e.g. "API calls", "UI colors")
+  4. [CODE: path/to/file]   — read actual source code (last resort — full file)
+     [SEARCH: pattern]      — ripgrep pattern search
+     [WEBSEARCH: query]     — web search for API docs, libraries
+
+Write all the tags you need, then write STOP on its own line.
+══════════════════════════════════════════════════════════════════════
+
+TASK: {task}
+
+PROJECT OVERVIEW (general map):
+{context}
+
+{cot_instructions}
+
+PLAN FORMAT — DETAILED ENOUGH TO CODE FROM DIRECTLY
+══════════════════════════════════════════════════════════════════════
+Your plan will be handed to a CODER AI that only writes code.
+The coder does NOT think, analyze, or search — it ONLY translates
+your plan into code. If your plan is vague, the code will be wrong.
+
+Write in PLAIN ENGLISH. NO CODE — no snippets, no pseudo-code.
+But be EXACT about: function names, parameter names, variable names,
+return types, data structures, and behavior.
+
+BAD (too vague):  "Add a pause feature"
+GOOD (precise):   "Add a pause feature to game.js:
+      - Add a boolean 'isPaused' initialized to false
+      - In the existing keydown handler, add a case for ' ' (Space):
+        toggle isPaused. When becoming true, call clearInterval on
+        the gameLoop timer ID. When becoming false, call setInterval
+        with gameLoop and the existing TICK_RATE.
+      - In the existing gameLoop function, add an early return if
+        isPaused is true (before any game logic runs).
+      - After the canvas draw calls, if isPaused, draw a
+        semi-transparent black overlay (rgba 0,0,0,0.5) and the
+        text 'PAUSED' in white 48px Arial, centered on the canvas."
+
+⚠️ FOLLOW THE USER'S INSTRUCTIONS EXACTLY.
+⚠️ COMPLETENESS: Re-read the TASK. Cover EVERY request.
+══════════════════════════════════════════════════════════════════════
+
+0. INFER INTENT: Restate what the user wants. Distinguish CONTEXT
+   (what exists now) from INSTRUCTIONS (what to change).
+
+## PLAN SUMMARY
+[One paragraph: what we're doing and the approach]
+
+## SHARED INTERFACES
+Names that MUST match across files/steps. The coder uses these EXACT
+names. List ALL shared function names, class names, variable names,
+parameter names, event names, data structure fields.
+If nothing is shared across files, write "(none)".
+
+Format:
+  - function_name(param1, param2) -> return_type — in file.py, called from other.py
+  - CONSTANT_NAME = value — used in both X and Y
+  - ClassName (fields: field1 type, field2 type) — created in X, used in Y
+
+## IMPLEMENTATION STEPS
+
+### STEP 1: [short name]
+DEPENDS ON: (none)
+FILES: path/to/file.py (modify), path/to/new.py (create)
+WHAT TO DO:
+  For EACH file, describe EXACTLY what to change:
+  
+  file.py:
+    - In function X, after the line that does Y, add a call to Z
+      with parameters A and B
+    - Add new function W that takes (param1: type, param2: type),
+      does [exact logic], and returns [what]
+    - At the top, add import for [module]
+  
+  new.py:
+    - Create with [exact list of functions/classes]
+    - Function F takes (params), does [logic], returns [what]
+    - Export [names] for use by other files
+
+### STEP 2: [short name]
+DEPENDS ON: STEP 1
+FILES: path/to/other.py (modify)
+WHAT TO DO:
+  other.py:
+    - Import [name] from [file created in step 1]
+    - In function G, replace the existing [logic] with a call to
+      [name] using [parameters]
+    - Handle the return value by [doing what]
+
+STEP RULES:
+- Each step = changes that must happen together
+- Steps with no dependencies run in parallel
+- Steps with DEPENDS ON wait and see the code from that step
+- Simple task = 1 step. Don't create unnecessary steps.
+
+## EDGE CASES
+
+## LOGIC CHECK
+Trace through the code AFTER your changes to verify it works:
+  "When X happens: call A → A calls new function B(params) → B returns C
+   → C is used by existing function D."
+Check: types match, async/sync correct, signatures match, data structures
+compatible with what the existing code expects.
+
+## TEST CRITERIA
+"""
+
+IMPLEMENT_PROMPT = """You are a coder. Implement the changes below step by step.
+For each step, write the code edits for that step, then move to the next.
+The steps are in order — later steps can use code from earlier ones.
+
+{step_instructions}
+
+{shared_interfaces}
+
+FILES (with line numbers):
+{file_content}
+
+{prev_code}
+
+OUTPUT FORMAT:
+
+For EXISTING files — use SEARCH/REPLACE. Copy-paste lines from the file
+above INCLUDING the line numbers. Always include ~10 lines of context
+above and below the change.
+
+=== EDIT: path/to/file.py ===
+[SEARCH]
+ 32	    existing_code_above()
+ 33	    more_context()
+ 34	    the_line_to_change()
+ 35	    context_below()
+ 36	    more_below()
+[/SEARCH]
+[REPLACE]
+    existing_code_above()
+    more_context()
+    the_new_code()
+    context_below()
+    more_below()
+[/REPLACE]
+
+KEY POINTS:
+- SEARCH: copy-paste from the file WITH line numbers (e.g. " 34\tcode")
+- REPLACE: write the new code WITHOUT line numbers (raw code only)
+- Always include ~10 lines of unchanged context above and below
+- The line numbers help you find the right place, especially in large files
+
+To DELETE code, keep context lines in REPLACE but remove target lines.
+
+For NEW files — write the COMPLETE file (no line numbers):
+=== FILE: path/to/newfile.ext ===
+```language
+complete file content
+```
+
+RULES:
+- SEARCH must match the file EXACTLY — copy-paste with line numbers.
+- REPLACE is raw code, NO line numbers.
+- Always include context above and below.
+- Work through steps in order.
+- For later steps, SEARCH should reflect earlier changes.
+- Implement EVERYTHING. Skip nothing.
+"""
+
+
+SUMMARY_PROMPT = """You just implemented code changes. Summarize what you did for the user.
+
+TASK: {task}
+
+FILES CHANGED:
+{files_changed}
+
+DIFF:
+{diff}
+
+Write a clear, concise summary in plain English:
+1. What files were created or modified
+2. What each change does
+3. Any important things the user should know (new dependencies, config changes, etc.)
+
+Keep it short — the user wants to understand what changed, not read the code again.
+Do NOT include any code in your summary.
+"""
+
+MAP_UPDATE_PROMPT = """You just implemented code changes. You need to update the project's code maps.
+
+DO NOT rewrite the maps. DO NOT restate them in your thinking.
+Output ONLY edit blocks for the specific parts that actually changed.
+
+TASK COMPLETED: {task}
+
+FILES CHANGED:
+{files_changed}
+
+DIFF OF CHANGES:
+{diff}
+
+CURRENT GENERAL MAP:
+{general_map}
+
+CURRENT DETAILED MAP:
+{detailed_map}
+
+YOUR JOB: Output edit blocks for each map that needs updating.
+If a map doesn't need changes, write "GENERAL: no changes" or "DETAILED: no changes".
+
+EDIT FORMAT — wrap edits with map headers:
+
+=== GENERAL MAP EDITS ===
+[SEARCH]
+exact text from current general map
+[/SEARCH]
+[REPLACE]
+new text (or empty to delete)
+[/REPLACE]
+
+[ADD_SECTION]
+## New Feature Name
+description of new feature
+[/ADD_SECTION]
+
+=== DETAILED MAP EDITS ===
+[SEARCH]
+exact text from current detailed map
+[/SEARCH]
+[REPLACE]
+updated text
+[/REPLACE]
+
+[ADD_SECTION]
+=== SECTION: New Feature ===
+### file.py — new_function(params)
+  Purpose: ...
+[/ADD_SECTION]
+
+RULES:
+- Copy SEARCH text EXACTLY from the current map (even one character off = edit ignored)
+- Only edit what the diff actually changed
+- Empty REPLACE deletes the matched text
+- ADD_SECTION appends to the end of that map
+- Keep your analysis SHORT. Your output is edit blocks, not prose.
+"""
+
+
+def _apply_map_edits(original_map: str, response_text: str) -> str:
+    """Parse [SEARCH]/[REPLACE] and [ADD_SECTION] blocks from response and
+    apply them to the original map. Empty [REPLACE] deletes."""
+    result = original_map
+
+    # Find SEARCH/REPLACE pairs
+    edit_pattern = re.compile(
+        r'\[SEARCH\](.*?)\[/SEARCH\]\s*\[REPLACE\](.*?)\[/REPLACE\]',
+        re.DOTALL,
+    )
+    for match in edit_pattern.finditer(response_text):
+        find_text = match.group(1).strip()
+        replace_text = match.group(2).strip()
+        if not find_text:
+            continue
+        if find_text in result:
+            result = result.replace(find_text, replace_text, 1)
+        else:
+            # Fuzzy: whitespace-normalized line match
+            find_lines = [l.strip() for l in find_text.split('\n')]
+            result_lines = result.split('\n')
+            for i in range(len(result_lines) - len(find_lines) + 1):
+                window = [result_lines[i + j].strip() for j in range(len(find_lines))]
+                if window == find_lines:
+                    if replace_text:
+                        result_lines[i:i + len(find_lines)] = replace_text.split('\n')
+                    else:
+                        del result_lines[i:i + len(find_lines)]
+                    result = '\n'.join(result_lines)
+                    break
+
+    # Find ADD_SECTION blocks — append to end
+    add_pattern = re.compile(r'\[ADD_SECTION\](.*?)\[/ADD_SECTION\]', re.DOTALL)
+    for match in add_pattern.finditer(response_text):
+        addition = match.group(1).strip()
+        if addition:
+            result += "\n\n" + addition
+
+    return result
+
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _format_research_cache(research_cache: dict | None, max_chars: int = 30000) -> str:
+    """Format the shared research cache into a readable section for prompt injection.
+
+    This lets downstream AIs (coders, reviewers) see everything that upstream
+    AIs (planners) already looked up, so they don't need to re-search.
+    Results are deduplicated by key — identical lookups only appear once.
+    """
+    if not research_cache:
+        return ""
+
+    parts = []
+    total = 0
+    for key, value in research_cache.items():
+        value = value.strip()
+        if not value:
+            continue
+        # key format is "TAG_TYPE:query" e.g. "REFS:call_with_tools"
+        entry = f"\n{value}"
+        if total + len(entry) > max_chars:
+            parts.append(f"\n... ({len(research_cache) - len(parts)} more cached lookups truncated)")
+            break
+        parts.append(entry)
+        total += len(entry)
+
+    if not parts:
+        return ""
+
+    return (
+        "\n\n══════════════════════════════════════════════════════════════\n"
+        "PRE-LOADED RESEARCH (from earlier pipeline stages — do NOT re-search these):\n"
+        "The planning AIs already looked these up. Use this data directly.\n"
+        "If you need something NOT listed here, you can still use tool tags.\n"
+        "══════════════════════════════════════════════════════════════\n"
+        + "\n".join(parts)
+        + "\n══════════════════════════════════════════════════════════════\n"
+    )
+
+
+def _check_syntax(filepath: str, content: str) -> tuple[bool, str]:
+    """Run a syntax check on code content based on file extension.
+
+    Returns (passed: bool, error_message: str).
+    If no checker is available for the file type, returns (True, "").
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+
+    if ext == ".py":
+        try:
+            compile(content, filepath, "exec")
+            return True, ""
+        except SyntaxError as e:
+            lineno = e.lineno or "?"
+            offset = e.offset or ""
+            msg = e.msg or "unknown syntax error"
+            # Extract the offending line for context
+            lines = content.split("\n")
+            context_lines = []
+            if isinstance(e.lineno, int) and e.lineno > 0:
+                start = max(0, e.lineno - 3)
+                end = min(len(lines), e.lineno + 2)
+                for i in range(start, end):
+                    marker = ">>>" if i == e.lineno - 1 else "   "
+                    context_lines.append(f"  {marker} {i + 1}: {lines[i]}")
+            context_str = "\n".join(context_lines)
+            return False, (
+                f"Python SyntaxError at line {lineno}, col {offset}: {msg}\n"
+                f"{context_str}"
+            )
+
+    elif ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+        # Use Node.js --check for JS/TS syntax validation
+        import tempfile
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=ext, delete=False, encoding="utf-8"
+            ) as f:
+                f.write(content)
+                tmp_path = f.name
+
+            # Try node --check (works for .js/.mjs/.cjs)
+            if ext in (".js", ".mjs", ".cjs"):
+                result = subprocess.run(
+                    ["node", "--check", tmp_path],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode != 0:
+                    err = result.stderr.strip()
+                    # Clean up the temp path from the error message
+                    err = err.replace(tmp_path, filepath)
+                    return False, f"JavaScript syntax error:\n{err}"
+
+            return True, ""
+        except FileNotFoundError:
+            # node not installed — skip
+            return True, ""
+        except subprocess.TimeoutExpired:
+            return True, ""
+        except Exception:
+            return True, ""
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    elif ext in (".json",):
+        import json
+        try:
+            json.loads(content)
+            return True, ""
+        except json.JSONDecodeError as e:
+            return False, f"JSON syntax error at line {e.lineno}, col {e.colno}: {e.msg}"
+
+    # HTML and CSS: skip — naive tag/brace counting produces too many
+    # false positives on complex files (scripts inside HTML, template
+    # literals, minified code) and wastes rounds in fix loops.
+
+    # No checker for this file type
+    return True, ""
+
+
+SYNTAX_FIX_PROMPT = """Fix the syntax error below. Do NOT change logic.
+Output ONLY the edit block, nothing else.
+
+FILE: {target_file}
+
+SYNTAX ERROR:
+{syntax_error}
+
+THE CODE:
+{broken_code}
+
+=== EDIT: {target_file} ===
+[SEARCH]
+the broken line(s) — copy-paste from above
+[/SEARCH]
+[REPLACE]
+the fixed line(s)
+[/REPLACE]
+"""
+
+
+async def _syntax_fix_loop(
+    target_file: str,
+    content: str,
+    project_root: str,
+    max_fix_attempts: int = 2,
+    detailed_map: str = "",
+    purpose_map: str = "",
+    research_cache: dict | None = None,
+) -> str | None:
+    """Check syntax and auto-fix errors. Returns fixed code or None."""
+    passed, syntax_err = _check_syntax(target_file, content)
+    if passed:
+        return content
+
+    for fix_round in range(1, max_fix_attempts + 1):
+        warn(f"  Syntax error in {target_file}: {syntax_err.split(chr(10))[0]}")
+        status(f"  Syntax fix round {fix_round}/{max_fix_attempts}...")
+
+        fix_prompt = SYNTAX_FIX_PROMPT.format(
+            target_file=target_file,
+            syntax_error=syntax_err,
+            broken_code=content,
+        )
+
+        fix_result = await _call_with_tools(
+            IMPLEMENT_MODEL, fix_prompt, project_root,
+            max_tokens=8192,
+            log_label=f"fixing syntax: {target_file} (round {fix_round})",
+        )
+
+        extracted = _extract_code_blocks(fix_result["answer"])
+
+        # Apply edits
+        applied = False
+        for edits_dict in [extracted.get("text_edits", {}), extracted.get("edits", {})]:
+            for fp, edits in edits_dict.items():
+                if not edits:
+                    continue
+                if isinstance(edits[0], tuple) and len(edits[0]) == 2:
+                    content = _apply_edits(content, edits)
+                else:
+                    content = _apply_line_edits(content, edits)
+                applied = True
+                break
+            if applied:
+                break
+        if not applied and extracted["new_files"]:
+            for fname, fcontent in extracted["new_files"].items():
+                content = fcontent
+                applied = True
+                break
+        if not applied:
+            warn(f"  Syntax fixer produced no edits — keeping code as-is")
+            return content  # return what we have, don't discard
+
+        passed, syntax_err = _check_syntax(target_file, content)
+        if passed:
+            success(f"  Syntax fixed in {target_file} (round {fix_round})")
+            return content
+
+    warn(f"  Could not fix syntax in {target_file} after {max_fix_attempts} rounds — keeping code")
+    return content  # return best effort, don't discard
+
+
+async def _call(model: str, prompt: str, max_tokens: int = 16384, log_label: str = "") -> dict:
+    result = await call_with_retry(model, prompt, max_tokens=max_tokens, log_label=log_label)
+    return {"model": model, "answer": result}
+
+
+# _call_with_tools imported from core.tool_call (shared with chat + research)
+
+
+def _extract_code_blocks(response: str) -> dict:
+    """
+    Extract edits and new files from AI response.
+    Primary format: [REPLACE LINES start-end]...[/REPLACE] (line-number based)
+    Fallback: [SEARCH]...[/SEARCH] [REPLACE]...[/REPLACE] (text matching)
+    
+    Returns {
+        "edits": {filepath: [(start, end, code), ...]},  # line-number edits
+        "text_edits": {filepath: [(search, replace), ...]},  # fallback text edits
+        "new_files": {filepath: content},
+    }
+    """
+    result = {"edits": {}, "text_edits": {}, "new_files": {}}
+
+    # ── Extract EDIT blocks ──────────────────────────────────────────────
+    edit_pattern = re.compile(
+        r'===\s*EDIT:\s*(.+?)\s*===\s*(.*?)(?====\s*(?:EDIT|FILE):|$)',
+        re.DOTALL
+    )
+    for edit_match in edit_pattern.finditer(response):
+        filepath = edit_match.group(1).strip()
+        edit_body = edit_match.group(2)
+
+        # ── Format 1: [REPLACE LINES start-end]...[/REPLACE] (primary) ──
+        line_edits = re.findall(
+            r'\[REPLACE\s+LINES\s+(\d+)\s*-\s*(\d+)\s*\]\s*\n?(.*?)\s*\[/REPLACE\]',
+            edit_body, re.DOTALL
+        )
+        if line_edits:
+            parsed = []
+            for start_s, end_s, code in line_edits:
+                parsed.append((int(start_s), int(end_s), code))
+            result["edits"].setdefault(filepath, []).extend(parsed)
+            continue  # skip text-based parsing for this file
+
+        # ── Format 2: [SEARCH]...[/SEARCH] [REPLACE]...[/REPLACE] (fallback) ──
+        pairs = []
+        xml_pairs = re.findall(
+            r'\[SEARCH\]\s*\n?(.*?)\s*\[/SEARCH\]\s*\n?\s*\[REPLACE\]\s*\n?(.*?)\s*\[/REPLACE\]',
+            edit_body, re.DOTALL
+        )
+        if xml_pairs:
+            pairs.extend(xml_pairs)
+
+        # Format 3: <<<< FIND ... >>>> <<<< REPLACE ... >>>>
+        if not pairs:
+            old_pairs = re.findall(
+                r'<<<<\s*FIND\s*\n?(.*?)\s*>>>>\s*\n?\s*<<<<\s*REPLACE\s*\n?(.*?)\s*>>>>',
+                edit_body, re.DOTALL
+            )
+            if old_pairs:
+                pairs.extend(old_pairs)
+
+        if pairs:
+            result["text_edits"].setdefault(filepath, []).extend(pairs)
+
+    # ── Extract FILE blocks (new files) ──────────────────────────────────
+    file_pattern = re.compile(
+        r'===\s*FILE:\s*(.+?)\s*===\s*```[^\n]*\n(.*?)```',
+        re.DOTALL
+    )
+    for file_match in file_pattern.finditer(response):
+        filepath = file_match.group(1).strip()
+        content = file_match.group(2).strip()
+        result["new_files"][filepath] = content
+
+    # ── Fallback: plain code blocks ──────────────────────────────────────
+    if not result["edits"] and not result["text_edits"] and not result["new_files"]:
+        all_blocks = re.findall(r'```[^\n]*\n(.*?)```', response, re.DOTALL)
+        if all_blocks:
+            longest = max(all_blocks, key=len)
+            result["new_files"]["main"] = longest.strip()
+
+    return result
+
+
+def _apply_line_edits(original: str, edits: list[tuple[int, int, str]]) -> str:
+    """Apply line-number based edits to file content.
+
+    Each edit is (start_line, end_line, new_code) where lines are 1-based.
+    ALL line numbers refer to the ORIGINAL file — they do NOT shift.
+    This works because edits are applied in reverse order (bottom to top).
+
+    - start < end: REPLACE lines start through end (inclusive) with new_code
+    - start == end: INSERT new_code AFTER that line (line itself is kept)
+    - empty new_code with start < end: DELETE those lines
+    """
+    lines = original.split('\n')
+
+    # Sort edits by start line DESCENDING so we apply from bottom to top
+    sorted_edits = sorted(edits, key=lambda e: e[0], reverse=True)
+
+    for start, end, new_code in sorted_edits:
+        # Convert to 0-based index
+        start_idx = max(0, start - 1)
+        end_idx = min(len(lines), end)  # end is inclusive, so we need end_idx = end
+
+        new_lines = new_code.split('\n') if new_code.strip() else []
+
+        if start == end:
+            # INSERT after this line (don't remove it)
+            lines[end_idx:end_idx] = new_lines
+            status(f"    Inserted {len(new_lines)} lines after line {start}")
+        else:
+            # REPLACE lines start through end (inclusive)
+            if new_lines:
+                lines[start_idx:end_idx] = new_lines
+                status(f"    Replaced lines {start}-{end} with {len(new_lines)} lines")
+            else:
+                # DELETE
+                del lines[start_idx:end_idx]
+                status(f"    Deleted lines {start}-{end}")
+
+    return '\n'.join(lines)
+
+
+def _strip_line_numbers(text: str) -> tuple[str, int | None]:
+    """Strip line number prefixes from text copied from a numbered file listing.
+
+    Input format: '  42\\tcode here' or '42\\tcode here' or '42' (blank line)
+    Returns (stripped_text, first_line_number or None).
+    """
+    lines = text.split('\n')
+    stripped = []
+    first_num = None
+    has_numbers = False
+
+    for line in lines:
+        # Match: optional whitespace + digits + tab + content
+        m = re.match(r'^\s*(\d+)\t(.*)$', line)
+        if m:
+            has_numbers = True
+            if first_num is None:
+                first_num = int(m.group(1))
+            stripped.append(m.group(2))
+        else:
+            # Also match: just a line number with no tab (blank line after strip)
+            m2 = re.match(r'^\s*(\d+)\s*$', line)
+            if m2 and has_numbers:
+                # Only treat as line number if we already found numbered lines
+                stripped.append('')
+            else:
+                stripped.append(line)
+
+    if has_numbers:
+        return '\n'.join(stripped), first_num
+    return text, None
+
+
+def _apply_edits(original: str, edits: list[tuple[str, str]]) -> str:
+    """Apply SEARCH/REPLACE edits to file content.
+
+    SEARCH text may contain line numbers (e.g. '  42\\tcode') from the
+    numbered file listing. These are stripped before matching, and used
+    as a hint to find the right location in the file.
+    """
+    import difflib
+
+    result = original
+    for find_text, replace_text in edits:
+        find_raw = find_text.strip()
+        replace_clean = replace_text.strip()
+
+        # Strip line numbers from SEARCH if present
+        find_clean, hint_line = _strip_line_numbers(find_raw)
+        find_clean = find_clean.strip()
+
+        if not find_clean:
+            continue
+
+        # ── Strategy 1: Exact match ──────────────────────────────────
+        if find_clean in result:
+            if not replace_clean:
+                lines = result.split('\n')
+                find_lines = find_clean.split('\n')
+                find_stripped = [l.strip() for l in find_lines]
+                for i in range(len(lines) - len(find_lines) + 1):
+                    window = [lines[i + j].strip() for j in range(len(find_lines))]
+                    if window == find_stripped:
+                        del lines[i:i + len(find_lines)]
+                        result = '\n'.join(lines)
+                        break
+                else:
+                    result = result.replace(find_clean, '', 1)
+            else:
+                result = result.replace(find_clean, replace_clean, 1)
+            continue
+
+        # ── Strategy 2: Line-number-guided match ─────────────────────
+        # If we have a line number hint, try matching near that line first
+        find_lines = [l.strip() for l in find_clean.split('\n')]
+        result_lines = result.split('\n')
+        found = False
+
+        if hint_line is not None:
+            # Search in a window around the hinted line (±30 lines)
+            hint_idx = max(0, hint_line - 1)  # 1-based to 0-based
+            search_start = max(0, hint_idx - 30)
+            search_end = min(len(result_lines), hint_idx + len(find_lines) + 30)
+
+            for i in range(search_start, min(search_end, len(result_lines) - len(find_lines) + 1)):
+                window = [result_lines[i + j].strip() for j in range(len(find_lines))]
+                if window == find_lines:
+                    if not replace_clean.strip():
+                        result_lines[i:i + len(find_lines)] = []
+                    else:
+                        result_lines[i:i + len(find_lines)] = replace_clean.split('\n')
+                    result = '\n'.join(result_lines)
+                    found = True
+                    break
+
+        # ── Strategy 3: Full whitespace-normalized scan ───────────────
+        if not found:
+            for i in range(len(result_lines) - len(find_lines) + 1):
+                window = [result_lines[i + j].strip() for j in range(len(find_lines))]
+                if window == find_lines:
+                    if not replace_clean.strip():
+                        result_lines[i:i + len(find_lines)] = []
+                    else:
+                        result_lines[i:i + len(find_lines)] = replace_clean.split('\n')
+                    result = '\n'.join(result_lines)
+                    found = True
+                    break
+
+        if found:
+            continue
+
+        # ── Strategy 4: Fuzzy match ──────────────────────────────────
+        find_joined = "\n".join(find_lines)
+        best_score, best_idx, best_length = 0.0, -1, len(find_lines)
+        for wsize in [len(find_lines), len(find_lines) - 1, len(find_lines) + 1]:
+            if wsize < 1 or wsize > len(result_lines):
+                continue
+            for i in range(len(result_lines) - wsize + 1):
+                window = [result_lines[i + j].strip() for j in range(wsize)]
+                score = difflib.SequenceMatcher(None, find_joined, "\n".join(window)).ratio()
+                if score > best_score:
+                    best_score, best_idx, best_length = score, i, wsize
+
+        if best_score >= 0.6 and best_idx >= 0:
+            success(f"Fuzzy matched FIND block ({best_score:.0%} similarity)")
+            result_lines = result.split('\n')
+            if not replace_clean.strip():
+                result_lines[best_idx:best_idx + best_length] = []
+            else:
+                result_lines[best_idx:best_idx + best_length] = replace_clean.split('\n')
+            result = '\n'.join(result_lines)
+        else:
+            preview = find_clean[:80].replace('\n', '\\n')
+            error(f"FIND block not matched — SKIPPING edit")
+            warn(f"  Tried to find: {preview}...")
+            if hint_line:
+                warn(f"  Line number hint was: {hint_line}")
+
+    return result
+
+
+def _smart_apply(original: str, extracted: dict, filepath: str) -> str | None:
+    """Apply edits from extracted code blocks — handles both line-number and text formats."""
+    # Try line-number edits first
+    if filepath in extracted["edits"]:
+        return _apply_line_edits(original, extracted["edits"][filepath])
+
+    # Fuzzy filepath match for line edits
+    for fp, edits in extracted["edits"].items():
+        if fp.endswith(filepath) or filepath.endswith(fp):
+            return _apply_line_edits(original, edits)
+
+    # Try text-based edits (fallback)
+    if filepath in extracted["text_edits"]:
+        return _apply_edits(original, extracted["text_edits"][filepath])
+
+    for fp, edits in extracted["text_edits"].items():
+        if fp.endswith(filepath) or filepath.endswith(fp):
+            return _apply_edits(original, edits)
+
+    return None
+
+
+async def _run_searches_and_augment(ai_response: str, project_root: str, context: str) -> str:
+    """Run any [SEARCH: pattern] tags found in AI response, append results to context."""
+    extra = await run_on_demand_searches(ai_response, project_root)
+    if extra:
+        context += f"\n\n=== ON-DEMAND SEARCH RESULTS ===\n{extra}"
+    return context
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE 1 — UNDERSTAND
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def phase_understand(task: str, project_root: str) -> dict:
+    """
+    3 AIs search codebase in parallel. Union ALL findings.
+    For empty/new projects: skips searching, returns minimal context.
+    Returns: {context: str, files: list[str], classification: str}
+    """
+    step("═══ Phase 1: UNDERSTAND ═══")
+
+    # Scan project structure
+    project_structure = scan_project(project_root)
+    # Extract file count from last line: "(N files)"
+    file_count_match = re.search(r'\((\d+) files?\)', project_structure)
+    file_count = int(file_count_match.group(1)) if file_count_match else 0
+
+    status(f"Project scanned: {file_count} files")
+
+    # ── Empty/new project: skip heavy searching ──────────────────────────
+    if file_count == 0:
+        status("Empty project — creating from scratch")
+        context = (
+            f"PROJECT: {project_root}\n"
+            f"STATUS: Empty directory — this is a NEW project.\n"
+            f"TASK: {task}\n\n"
+            f"There are no existing files. Create all files from scratch."
+        )
+        return {
+            "context": context,
+            "files": [],
+            "project_structure": project_structure,
+        }
+
+    # ── Existing project: 3 AIs search in parallel ────────────────────
+    step("3 AIs searching codebase...")
+    prompt = UNDERSTAND_PROMPT.format(
+        task=task,
+        project_structure=project_structure[:8000],
+    )
+
+    results = list(await asyncio.gather(
+        *[_call_with_tools(m, prompt, project_root, log_label="understanding codebase") for m in UNDERSTAND_MODELS],
+        return_exceptions=True,
+    ))
+    results = [r for r in results if isinstance(r, dict) and r.get("answer")]
+
+    if not results:
+        raise RuntimeError("All 3 AIs failed in Phase 1")
+
+    # Union ALL findings — if ANY AI says it's relevant, include it
+    all_files = set()
+    all_context_parts = []
+
+    for r in results:
+        ai_name = r["model"].split("/")[-1]
+        all_context_parts.append(f"\n=== {ai_name}'s analysis ===\n{r['answer']}")
+
+        # Extract file paths mentioned
+        for line in r["answer"].split("\n"):
+            # Match common path patterns
+            path_match = re.findall(r'[\w./\-]+\.(?:py|js|ts|html|css|json|lean|c|cpp|h|rs|java|go|rb|toml|yaml|yml|md)', line)
+            all_files.update(path_match)
+
+    # Read all mentioned files into context
+    for fpath in sorted(all_files):
+        full_path = os.path.join(project_root, fpath)
+        content = read_file(full_path)
+        if content and not content.startswith("["):
+            all_context_parts.append(f"\n══ {fpath} ══\n{content}")
+
+    full_context = "\n".join(all_context_parts)
+    status(f"Phase 1: {len(results)} AIs, {len(all_files)} files, {len(full_context)} chars context")
+    success("Phase 1 complete — code understood")
+
+    return {
+        "context": full_context,
+        "files": sorted(all_files),
+        "project_structure": project_structure,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE 2 — PLAN (multi-model generate → single AI merge)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def phase_plan(task: str, context: str, complexity: int, project_root: str,
+                     plan_feedback: str = "", detailed_map: str = "",
+                     purpose_map: str = "",
+                     is_new_project: bool = False) -> tuple[str, dict]:
+    """
+    Planning:
+      Standard (complexity < 7):
+        Layer 1: 4 AIs race, first 3 win, last is cancelled
+        Layer 2: GLM-5 merges the 3 winning plans into final plan
+      Deep (complexity >= 7):
+        Layer 1: 4 AIs race, first 3 win, last is cancelled
+        Layer 2: 4 AIs each read the 3 plans, find flaws/strengths,
+                 write their own improved plan (parallel)
+        Layer 3: GLM-5 reads all 4 improved plans, writes final plan
+
+    Research from all planning AIs is accumulated in a shared cache and
+    returned so implement + review can reuse it without re-running lookups.
+
+    Returns (final_plan, research_cache).
+    """
+    extended = complexity >= 7
+    mode_label = "EXTENDED 3-layer" if extended else "STANDARD"
+    step(f"=== Phase 2: PLAN [{mode_label}] ===")
+
+    PLAN_MODELS = [
+        "nvidia/deepseek-v3.2",
+        "nvidia/qwen-3.5",
+        "nvidia/minimax-m2.5",
+        "nvidia/nemotron-super",
+    ]
+
+    cot = PLAN_COT_NEW if is_new_project else PLAN_COT_EXISTING
+    plan_prompt = PLAN_PROMPT.format(
+        task=task,
+        context=context[:30000],
+        cot_instructions=cot,
+    )
+
+    if plan_feedback:
+        plan_prompt += (
+            f"\n\nPREVIOUS PLAN WAS REJECTED:\n{plan_feedback}\n"
+            f"Fix the issues above. Do NOT repeat the same mistakes."
+        )
+
+    # Shared research cache — accumulates lookups across all AIs in this workflow
+    research_cache: dict[str, str] = {}
+
+    # == Layer 1: 4 AIs RACE — keep first 3, kill the last ==
+    step(f"Layer 1: {len(PLAN_MODELS)} models racing (first 3 win)...")
+
+    plan_tasks = [
+        asyncio.create_task(_call_with_tools(
+            m, plan_prompt, project_root,
+            detailed_map=detailed_map, purpose_map=purpose_map,
+            research_cache=research_cache,
+            log_label=f"planning (Layer 1)",
+        ))
+        for m in PLAN_MODELS
+    ]
+
+    # Wait for 3 to complete, cancel the rest
+    done, pending = await asyncio.wait(
+        plan_tasks, return_when=asyncio.ALL_COMPLETED, timeout=None
+    ) if len(PLAN_MODELS) <= 3 else await asyncio.wait(
+        plan_tasks, return_when=asyncio.FIRST_COMPLETED
+    )
+
+    # For >3 models: keep collecting until we have 3, then cancel the rest
+    if len(PLAN_MODELS) > 3:
+        completed: list = list(done)
+        pending_set = set(pending)
+        while len(completed) < 3 and pending_set:
+            more_done, pending_set = await asyncio.wait(
+                pending_set, return_when=asyncio.FIRST_COMPLETED
+            )
+            completed.extend(more_done)
+        # Cancel any remaining (the slowest)
+        for t in pending_set:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        status(f"Layer 1: {len(completed)} finished first, cancelled {len(pending_set)} stragglers")
+        done_tasks = completed
+    else:
+        done_tasks = list(done)
+
+    # Collect results from winners
+    plans = []
+    for t in done_tasks:
+        try:
+            r = t.result()
+            if isinstance(r, dict) and r.get("answer"):
+                plans.append(r)
+        except Exception:
+            pass
+
+    if not plans:
+        raise RuntimeError("All models failed in planning")
+
+    status(f"Layer 1: got {len(plans)} winning plans (research_cache: {len(research_cache)} entries)")
+
+    all_plans_text = "\n\n".join(
+        f"=== PLAN BY {p['model'].split('/')[-1].upper()} ===\n{p['answer']}"
+        for p in plans
+    )
+
+    if extended:
+        # == Layer 2: 4 AIs each pick the best plan and improve it ==
+        step(f"Layer 2: 4 AIs picking best plan and improving...")
+
+        # Pre-load Layer 1 research
+        preloaded_research = _format_research_cache(research_cache)
+
+        improve_prompt = SYSTEM_KNOWLEDGE + f"""
+
+You are a senior engineer. You have been given {len(plans)} independent plans
+for a coding task.
+
+YOUR JOB:
+1. Read ALL {len(plans)} plans carefully
+2. PICK THE BEST ONE — the plan that:
+   - Most accurately does what the user asked
+   - Works correctly with the existing code (right patterns, types, signatures)
+   - Has the fewest logic errors and missing steps
+   - Is the most complete and detailed
+3. State which plan you picked and WHY (one paragraph)
+4. IMPROVE that plan — make it even better:
+   - Fix any remaining bugs or logic errors
+   - Add missing edge cases and error handling
+   - Make the instructions more precise and detailed
+   - Add any good ideas from the OTHER plans that are COMPATIBLE
+     (same patterns, same types — don't mix incompatible approaches)
+   - Make it more robust
+
+Do NOT merge plans. Do NOT combine incompatible approaches.
+Start from the BEST plan and improve it.
+
+TASK: {task}
+
+PROJECT:
+{context[:15000]}
+
+ALL PLANS FROM LAYER 1:
+{all_plans_text}
+{preloaded_research}
+TOOLS (verify against real code):
+  [REFS: name] / [LSP: name] / [CODE: path]
+
+FORMAT:
+
+## BEST PLAN: [which plan and why]
+
+## PLAN SUMMARY
+## SHARED INTERFACES
+## IMPLEMENTATION STEPS
+### STEP N: [name]
+DEPENDS ON: ...
+FILES: ...
+WHAT TO DO: ...
+## EDGE CASES
+## LOGIC CHECK
+Trace through code after changes. Verify types, signatures, async/sync match.
+## TEST CRITERIA
+"""
+
+        improved_results = list(await asyncio.gather(
+            *[_call_with_tools("nvidia/nemotron-super", improve_prompt, project_root,
+                               detailed_map=detailed_map, purpose_map=purpose_map,
+                               research_cache=research_cache,
+                               log_label="improving plan (Layer 2)")
+              for _ in range(4)],
+            return_exceptions=True,
+        ))
+        improved = [d for d in improved_results if isinstance(d, dict) and d.get("answer")]
+
+        if not improved:
+            warn("Layer 2: all failed, falling back to Layer 1 plans")
+            improved = plans
+
+        status(f"Layer 2: got {len(improved)} improved plans (cache: {len(research_cache)} entries)")
+
+
+        all_improved_text = "\n\n".join(
+            f"=== IMPROVED PLAN BY {d['model'].split('/')[-1].upper()} ===\n{d['answer']}"
+            for d in improved
+        )
+
+        # == Layer 3: GLM-5 reads all improved plans, finds flaws/strengths, writes final ==
+        step("Layer 3: GLM-5 writing final plan...")
+
+        # Update pre-loaded research (now includes Layer 2's lookups too)
+        preloaded_research = _format_research_cache(research_cache)
+
+        verify_block = ""
+        if not is_new_project:
+            verify_block = (
+                "Verify claims against real code:\n"
+                "  [REFS: name] / [LSP: name] / [DETAIL: feature] / [CODE: path]\n"
+                "  [REFS: name] — find all definitions, imports, usages\n"
+            )
+
+        merge_prompt = SYSTEM_KNOWLEDGE + f"""
+
+YOUR ROLE: FINAL PLAN WRITER (Layer 3 of 3)
+
+4 engineers each wrote a plan. Then 4 senior engineers each picked the best
+plan and improved it. You now have {len(improved)} improved plans.
+
+YOUR JOB:
+1. Read ALL {len(improved)} improved plans
+2. PICK THE BEST ONE — the one that:
+   - Most completely does what the user asked
+   - Has the most correct logic (works with the existing code)
+   - Is the most detailed and precise
+   - Has the fewest remaining issues
+3. State which plan you picked and WHY
+4. IMPROVE it one final time:
+   - Fix any remaining logic errors or missing steps
+   - Make instructions even more precise for the coder
+   - Add any good ideas from other plans that are COMPATIBLE
+   - Verify the logic check: trace the code flow after changes
+   - Use [CODE: path] to verify against real code if unsure
+
+Do NOT merge plans. Pick the best, improve it.
+
+TASK: {task}
+
+PROJECT:
+{context[:10000]}
+
+{verify_block}
+
+ALL IMPROVED PLANS (Layer 2 output):
+{all_improved_text[:30000]}
+{preloaded_research}
+
+Output the FINAL plan:
+
+## BEST PLAN: [which and why]
+## PLAN SUMMARY
+## SHARED INTERFACES
+## IMPLEMENTATION STEPS
+### STEP N: [name]
+DEPENDS ON: ...
+FILES: ...
+WHAT TO DO: ...
+## EDGE CASES
+## LOGIC CHECK
+Trace through code after changes. Verify types, signatures, async/sync match.
+## TEST CRITERIA
+"""
+
+        merger_result = await _call_with_tools(
+            "nvidia/glm-5", merge_prompt, project_root,
+            detailed_map=detailed_map, purpose_map=purpose_map,
+            research_cache=research_cache,
+            log_label="merging plans (final)")
+
+    else:
+        # == Standard: GLM-5 merges plans directly (no debate) ==
+        step("Layer 2: GLM-5 merging plans...")
+
+        # Pre-load Layer 1 research for the merger
+        preloaded_research = _format_research_cache(research_cache)
+
+        verify_block = ""
+        if not is_new_project:
+            verify_block = (
+                "Verify claims against real code:\n"
+                "  [REFS: name] / [LSP: name] / [DETAIL: feature] / [CODE: path]\n"
+                "  [REFS: name] — find all definitions, imports, usages\n"
+                "Write tags, wait, then proceed.\n"
+            )
+
+        merge_prompt = SYSTEM_KNOWLEDGE + f"""
+
+YOUR ROLE: PICK THE BEST PLAN AND IMPROVE IT
+
+You have {len(plans)} independent plans for a coding task.
+
+YOUR JOB:
+1. Read ALL plans carefully
+2. PICK THE BEST ONE — the one that:
+   - Most accurately does what the user asked
+   - Works correctly with the existing code
+   - Is the most complete and detailed
+   - Has the fewest logic errors
+3. State which plan you picked and WHY
+4. IMPROVE it:
+   - Fix remaining bugs or logic errors
+   - Add missing edge cases and error handling
+   - Make instructions more precise
+   - Add compatible ideas from other plans (same patterns, same types)
+
+Do NOT merge plans. Pick the best, improve it.
+
+TASK: {task}
+
+PROJECT:
+{context[:15000]}
+
+{verify_block}
+
+ALL PLANS:
+{all_plans_text}
+{preloaded_research}
+
+Output the FINAL plan:
+
+## BEST PLAN: [which and why]
+## PLAN SUMMARY
+## SHARED INTERFACES
+## IMPLEMENTATION STEPS
+### STEP N: [name]
+DEPENDS ON: ...
+FILES: ...
+WHAT TO DO: ...
+## EDGE CASES
+## LOGIC CHECK
+Trace through code after changes. Verify types, signatures, async/sync match.
+## TEST CRITERIA
+"""
+
+        merger_result = await _call_with_tools(
+            "nvidia/glm-5", merge_prompt, project_root,
+            detailed_map=detailed_map, purpose_map=purpose_map,
+            research_cache=research_cache,
+            log_label="merging plans")
+
+    if not merger_result.get("answer"):
+        best = max(plans, key=lambda p: len(p["answer"]))
+        return best["answer"], research_cache
+
+    best_plan = merger_result["answer"]
+    status(f"Phase 2: final plan = {len(best_plan)} chars")
+    success(f"Phase 2 complete ({mode_label}, {len(research_cache)} cached lookups)")
+    return best_plan, research_cache
+
+
+# =====================================================================
+#  PHASE 3 -- IMPLEMENT (step-based DAG: parallel when independent,
+#             sequential when dependent, one coder per step)
+# =====================================================================
+
+def _extract_shared_interfaces(plan: str) -> str:
+    """Extract the SHARED INTERFACES section from the plan."""
+    match = re.search(
+        r'##\s*SHARED\s+INTERFACES\s*\n(.*?)(?=\n##\s|\Z)',
+        plan, re.DOTALL | re.IGNORECASE,
+    )
+    if match:
+        text = match.group(1).strip()
+        if text.lower() not in ("(none)", "none", "n/a", ""):
+            return text
+    return ""
+
+
+def _extract_impl_steps(plan: str) -> list[dict]:
+    """Parse IMPLEMENTATION STEPS from the plan.
+
+    Returns a list of step dicts:
+      [{"num": 1, "name": "...", "depends_on": [int], "files": [str],
+        "details": "...", "done": False, "produced_files": {}}]
+
+    Falls back to a single step containing all files if no steps found.
+    """
+    steps = []
+    step_pattern = re.compile(
+        r'###\s*STEP\s*(\d+)\s*[:\-—]\s*(.+?)(?=\n)',
+        re.IGNORECASE,
+    )
+    matches = list(step_pattern.finditer(plan))
+
+    if not matches:
+        # No steps found — return empty, caller will use single-step fallback
+        return []
+
+    for i, m in enumerate(matches):
+        num = int(m.group(1))
+        name = m.group(2).strip()
+
+        # Get the body of this step (text until next ### STEP or ## heading)
+        start = m.end()
+        if i + 1 < len(matches):
+            end = matches[i + 1].start()
+        else:
+            # Until next ## heading or end of plan
+            next_heading = re.search(r'\n##\s+[A-Z]', plan[start:])
+            end = start + next_heading.start() if next_heading else len(plan)
+        body = plan[start:end]
+
+        # Parse DEPENDS ON
+        deps = []
+        dep_match = re.search(r'DEPENDS\s*ON\s*[:]\s*(.+)', body, re.IGNORECASE)
+        if dep_match:
+            dep_text = dep_match.group(1).strip()
+            if dep_text.lower() not in ("(none)", "none", "-", "n/a", ""):
+                dep_nums = re.findall(r'STEP\s*(\d+)', dep_text, re.IGNORECASE)
+                deps = [int(d) for d in dep_nums]
+
+        # Parse FILES
+        files = []
+        files_match = re.search(r'FILES\s*[:]\s*(.+)', body, re.IGNORECASE)
+        if files_match:
+            files_text = files_match.group(1).strip()
+            file_paths = re.findall(
+                r'([\w./\-]+\.(?:py|js|ts|jsx|tsx|html|css|json|lean|c|cpp|h|rs|java|go|rb|toml|yaml|yml|md|mjs|cjs|svelte|vue))',
+                files_text,
+            )
+            files = list(dict.fromkeys(file_paths))  # dedup, preserve order
+
+        # Parse step instructions (WHAT TO DO or DETAILS section)
+        details = body
+        # Remove the parsed header lines from details
+        for pattern in [r'DEPENDS\s*ON\s*[:].+', r'FILES\s*[:].+']:
+            details = re.sub(pattern, '', details, flags=re.IGNORECASE)
+        # Also remove the "WHAT TO DO:" header if present
+        details = re.sub(r'WHAT\s+TO\s+DO\s*:', '', details, flags=re.IGNORECASE)
+        details = details.strip()
+
+        steps.append({
+            "num": num,
+            "name": name,
+            "depends_on": deps,
+            "files": files,
+            "details": details,
+            "done": False,
+            "produced_files": {},  # fp → content, filled after execution
+        })
+
+    return steps
+
+
+def _apply_extracted_code(
+    extracted: dict, file_contents: dict[str, str], sandbox: Sandbox,
+) -> dict[str, str]:
+    """Apply extracted edits and new files. Returns {filepath: content} of what changed.
+    Handles both line-number edits and text-based edits (fallback)."""
+    result = {}
+
+    def _match_fp(filepath: str) -> str:
+        if filepath in file_contents:
+            return filepath
+        for known_fp in file_contents:
+            if known_fp.endswith(filepath) or filepath.endswith(known_fp):
+                return known_fp
+        return filepath
+
+    # Apply line-number edits (primary format)
+    for filepath, line_edits in extracted["edits"].items():
+        matched_fp = _match_fp(filepath)
+        existing = file_contents.get(matched_fp, "")
+        if existing:
+            modified = _apply_line_edits(existing, line_edits)
+            result[matched_fp] = modified
+        else:
+            # New file from edit blocks — collect replacement code
+            code_parts = [code.strip() for _, _, code in line_edits if code.strip()]
+            if code_parts:
+                result[matched_fp] = "\n\n".join(code_parts)
+
+    # Apply text-based edits (fallback format)
+    for filepath, text_edits in extracted.get("text_edits", {}).items():
+        matched_fp = _match_fp(filepath)
+        if matched_fp in result:
+            continue  # already handled by line edits
+        existing = file_contents.get(matched_fp, "")
+        if existing:
+            modified = _apply_edits(existing, text_edits)
+            result[matched_fp] = modified
+        else:
+            replace_parts = [rt.strip() for _, rt in text_edits if rt.strip()]
+            if replace_parts:
+                result[matched_fp] = "\n\n".join(replace_parts)
+
+    # New files
+    for filepath, content in extracted["new_files"].items():
+        matched_fp = _match_fp(filepath)
+        result[matched_fp] = content
+
+    return result
+
+
+async def phase_implement(
+    task: str, plan: str, context: str, sandbox: Sandbox,
+    project_root: str, files_to_modify: list[str], detailed_map: str = "",
+    purpose_map: str = "",
+    research_cache: dict | None = None,
+) -> tuple[str, Sandbox]:
+    """
+    ONE coder AI, ONE call. The plan's steps become the AI's chain of thought.
+    It works through step 1, writes edits, then step 2 using step 1's code, etc.
+    All in one response. Then ONE reviewer checks everything.
+    Returns: (plan, sandbox_with_changes)
+    """
+    step("=== Phase 3: IMPLEMENT (single coder) ===")
+
+    # Collect all target files
+    files_to_create = _extract_new_files_from_plan(plan)
+    all_files = list(set(files_to_modify + files_to_create))
+
+    # Also grab files from plan steps
+    impl_steps = _extract_impl_steps(plan)
+    for s in impl_steps:
+        all_files.extend(s["files"])
+    all_files = list(dict.fromkeys(all_files))  # dedup, preserve order
+
+    if not all_files:
+        all_files = files_to_modify if files_to_modify else ["main"]
+    all_files = [
+        os.path.relpath(f, project_root) if os.path.isabs(f) else f
+        for f in all_files
+    ]
+
+    status(f"Target files ({len(all_files)}): {', '.join(all_files)}")
+
+    # Load file contents
+    file_contents: dict[str, str] = {}
+    for fp in all_files:
+        full_path = os.path.join(project_root, fp)
+        existing = sandbox.load_file(fp) or read_file(full_path) or ""
+        file_contents[fp] = existing
+
+    # Build file content block — always with line numbers
+    file_block_parts = []
+    for fp, content in file_contents.items():
+        if not content:
+            file_block_parts.append(
+                f"\n== {fp} (NEW FILE — write complete file) ==\n"
+                f"(does not exist yet)\n"
+            )
+        elif content.count('\n') < 300:
+            numbered = add_line_numbers(content)
+            file_block_parts.append(
+                f"\n== {fp} ({content.count(chr(10)) + 1} lines) ==\n"
+                f"{numbered}\n"
+            )
+        else:
+            sectioned = extract_relevant_sections(content, plan, context_lines=100)
+            file_block_parts.append(
+                f"\n== {fp} (large file, showing relevant sections) ==\n"
+                f"{sectioned}\n"
+            )
+    file_block = "\n".join(file_block_parts)
+
+    # Extract shared interfaces and step instructions from plan
+    shared_interfaces = _extract_shared_interfaces(plan)
+    iface_block = ""
+    if shared_interfaces:
+        iface_block = f"SHARED INTERFACES (use these EXACT names):\n{shared_interfaces}\n"
+
+    # Build step instructions as CoT
+    if impl_steps:
+        steps_text = "Follow these steps IN ORDER. Each step builds on the previous.\n\n"
+        for s in impl_steps:
+            steps_text += f"STEP {s['num']}: {s['name']}\n"
+            steps_text += f"Files: {', '.join(s['files'])}\n"
+            steps_text += f"{s['details']}\n\n"
+    else:
+        # No steps parsed — use plan directly
+        steps_text = plan[:12000]
+
+    # Build prompt
+    impl_prompt = IMPLEMENT_PROMPT.format(
+        step_instructions=steps_text,
+        shared_interfaces=iface_block,
+        file_content=file_block,
+        prev_code="",
+    )
+
+    status(f"Coder prompt: {len(impl_prompt)} chars")
+
+    MAX_RETRIES = 2
+    for attempt in range(1, MAX_RETRIES + 1):
+        step(f"Coder writing all files (attempt {attempt})")
+
+        impl_result = await _call_with_tools(
+            IMPLEMENT_MODEL, impl_prompt, project_root,
+            detailed_map=detailed_map, purpose_map=purpose_map,
+            research_cache=research_cache,
+            log_label="implementing all changes",
+        )
+
+        extracted = _extract_code_blocks(impl_result["answer"])
+        produced = _apply_extracted_code(extracted, file_contents, sandbox)
+
+        if not produced:
+            # Fallback for new files
+            raw_blocks = re.findall(r'```[^\n]*\n(.*?)```', impl_result["answer"], re.DOTALL)
+            if raw_blocks and len(all_files) == 1:
+                produced[all_files[0]] = max(raw_blocks, key=len).strip()
+
+        if not produced:
+            warn(f"  No code produced — retrying")
+            continue
+
+        # Syntax-fix each file
+        for fp, content in list(produced.items()):
+            produced[fp] = await _syntax_fix_loop(
+                fp, content, project_root,
+                detailed_map=detailed_map, purpose_map=purpose_map,
+                research_cache=research_cache,
+            )
+
+        # Write to sandbox
+        for fp, content in produced.items():
+            sandbox.write_file(fp, content)
+            status(f"  {fp}: done ({len(content)} chars)")
+
+        success(f"Phase 3 complete — {len(produced)} files implemented")
+        return plan, sandbox
+
+    warn("Phase 3: giving up after retries")
+    return plan, sandbox
+
+
+# =====================================================================
+#  PHASE 3.5 -- REVIEW (single AI reviews ALL changes together)
+# =====================================================================
+
+async def phase_review(
+    task: str, plan: str, sandbox: Sandbox,
+    project_root: str, detailed_map: str = "",
+    purpose_map: str = "",
+    context: str = "",
+    research_cache: dict | None = None,
+) -> tuple[bool, Sandbox]:
+    """
+    ONE reviewer AI sees ALL changed files together, assesses whether the
+    implementation will actually work as a whole, and fixes issues.
+    Uses [REFS:], [LSP:], etc. to verify cross-file dependencies.
+    Returns: (had_fixes, sandbox)
+    """
+    step("=== Phase 3.5: CODE REVIEW (single reviewer, all files) ===")
+
+    # Collect all changed files
+    changed_files = {}
+    for fp, content in sandbox.modified_files.items():
+        changed_files[fp] = content
+    for fp, content in sandbox.new_files.items():
+        changed_files[fp] = content
+
+    if not changed_files:
+        status("No changed files to review")
+        return False, sandbox
+
+    status(f"Reviewing {len(changed_files)} changed file(s) together: {', '.join(changed_files.keys())}")
+
+    # Build a single block with ALL changed files — with line numbers for SEARCH
+    all_files_block = ""
+    for fp, content in changed_files.items():
+        numbered = add_line_numbers(content)
+        all_files_block += f"\n{'═' * 60}\n== {fp} ==\n{'═' * 60}\n{numbered}\n"
+
+    # Pre-load research cache so reviewer already has planner+coder lookups
+    preloaded_research = _format_research_cache(research_cache)
+
+    review_prompt = SYSTEM_KNOWLEDGE + f"""
+
+══════════════════════════════════════════════════════════════════════
+YOUR ROLE: CODE REVIEWER — SINGLE PASS OVER ALL CHANGES
+══════════════════════════════════════════════════════════════════════
+
+You are reviewing ALL files that were just written/edited by coding AIs.
+Your job is to assess whether the WHOLE implementation will actually WORK —
+not just each file in isolation, but how they fit together.
+
+Multiple coding AIs worked in parallel on different files. They each saw
+the plan but they did NOT see each other's code. You are the first one
+to see everything together. Look for integration issues.
+
+TASK: {task}
+
+PLAN (what should have been implemented):
+{plan[:10000]}
+
+ALL CHANGED FILES (full content):
+{all_files_block}
+
+PROJECT CONTEXT:
+{context[:8000]}
+{preloaded_research}
+
+══════════════════════════════════════════════════════════════════════
+YOUR CHAIN OF THOUGHT
+══════════════════════════════════════════════════════════════════════
+
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 1 — VERIFY CROSS-FILE INTEGRATION                        │
+└─────────────────────────────────────────────────────────────────┘
+
+The coders worked in parallel. Check if their code actually connects:
+  - File A calls function X from File B — does B actually export X
+    with the right signature? Use [REFS: X] to verify.
+  - Data flows from one file to another — are the types/formats
+    compatible? Use [LSP: name] to check types.
+  - Shared state — do files agree on the structure?
+  - Import paths — are they correct? Do the modules exist?
+
+Write your analysis: what connects, what might break.
+
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 2 — VERIFY AGAINST EXISTING CODE                         │
+└─────────────────────────────────────────────────────────────────┘
+
+The changed files interact with UNCHANGED files in the project.
+  - Use [REFS: name] to check that functions called from unchanged
+    code still exist and have the right signature.
+  - Use [LSP: name] to verify type compatibility with the rest
+    of the codebase.
+  - Use [CODE: path] if you need to see an unchanged file.
+
+Write your analysis: what could break in the wider project.
+
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 3 — CHECK EACH FILE FOR BUGS                             │
+└─────────────────────────────────────────────────────────────────┘
+
+For each changed file:
+  1. Does it implement its part of the plan correctly?
+  2. Logic errors or bugs?
+  3. Missing error handling or edge cases?
+  4. Missing imports?
+  5. Syntax issues (mismatched brackets, bad indentation)?
+
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 4 — WRITE FIXES                                          │
+└─────────────────────────────────────────────────────────────────┘
+
+If everything works: write APPROVED
+
+If there are issues, fix them with SEARCH/REPLACE blocks.
+Copy-paste from the file WITH line numbers in SEARCH.
+Write raw code (no line numbers) in REPLACE.
+Include ~10 lines of context above and below.
+
+=== EDIT: path/to/file1.py ===
+[SEARCH]
+ 30	    context_above()
+ 31	    broken_code()
+ 32	    context_below()
+[/SEARCH]
+[REPLACE]
+    context_above()
+    fixed_code()
+    context_below()
+[/REPLACE]
+
+RULES:
+- SEARCH: copy-paste WITH line numbers from above
+- REPLACE: raw code, NO line numbers
+- Include ~10 lines of context
+- Only fix real issues. Do NOT refactor for style
+══════════════════════════════════════════════════════════════════════
+
+TOOLS — use these to VERIFY before making claims:
+  [REFS: name]          — find where a function is defined, imported, used
+  [LSP: name]           — semantic deps, types, what depends on this
+  [CODE: path/file]     — read unchanged source code for context
+  [SEARCH: pattern]     — ripgrep search across the project
+Write tags, then STOP on its own line. Wait for results before continuing.
+"""
+
+    result = await _call_with_tools(
+        "nvidia/glm-5", review_prompt, project_root,
+        detailed_map=detailed_map, purpose_map=purpose_map,
+        research_cache=research_cache,
+        log_label="reviewing all changes",
+    )
+    answer = result.get("answer", "")
+
+    if "APPROVED" in answer.upper() and "[SEARCH]" not in answer and "[REPLACE" not in answer:
+        success(f"Code review: all {len(changed_files)} files APPROVED")
+        return False, sandbox
+
+    # Extract and apply edits
+    extracted = _extract_code_blocks(answer)
+    produced = _apply_extracted_code(extracted, changed_files, sandbox)
+
+    total_fixes = 0
+    for matched_fp, modified in produced.items():
+        # Syntax-fix loop (always returns content)
+        fixed = await _syntax_fix_loop(
+            matched_fp, modified, project_root,
+            detailed_map=detailed_map, purpose_map=purpose_map,
+            research_cache=research_cache,
+        )
+        sandbox.write_file(matched_fp, fixed)
+        total_fixes += 1
+        status(f"  {matched_fp}: fixed")
+
+    if total_fixes:
+        success(f"Code review: applied {total_fixes} fixes across {len(changed_files)} files")
+    else:
+        success(f"Code review: all {len(changed_files)} files APPROVED (no actionable fixes)")
+
+    return total_fixes > 0, sandbox
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE 4 — TEST (optional)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def phase_test(test_command: str, project_root: str) -> dict:
+    """Run tests. Only called if user asked for testing."""
+    step("═══ Phase 4: TEST ═══")
+
+    try:
+        result = subprocess.run(
+            test_command, shell=True, capture_output=True, text=True,
+            timeout=120, cwd=project_root,
+        )
+        passed = result.returncode == 0
+        output = result.stdout + "\n" + result.stderr
+
+        if passed:
+            success("Tests PASSED")
+        else:
+            warn(f"Tests FAILED (exit {result.returncode})")
+
+        return {
+            "passed": passed,
+            "output": output[:10000],
+            "exit_code": result.returncode,
+        }
+    except subprocess.TimeoutExpired:
+        warn("Tests timed out (120s)")
+        return {"passed": False, "output": "TIMEOUT after 120s", "exit_code": -1}
+    except Exception as e:
+        error(f"Test execution failed: {e}")
+        return {"passed": False, "output": str(e), "exit_code": -1}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def code_agent(state: AgentState) -> AgentState:
+    """
+    Full coding agent workflow.
+    Expects state to have: raw_input, classification (with complexity, domain).
+    Optionally: project_root in state or defaults to cwd.
+    """
+    step("═══ CODING AGENT ═══")
+
+    task = state.get("processed_input", state["raw_input"])
+    classification = state.get("classification", {})
+    complexity = classification.get("complexity", 5)
+
+    # Determine project root
+    project_root = state.get("project_root", os.getcwd())
+    status(f"Project: {project_root}")
+    status(f"Complexity: {complexity}")
+
+    # Check if user wants testing
+    wants_test = any(kw in task.lower() for kw in ["test", "run test", "verify", "check if"])
+    test_command = None
+
+    # Extract test command if specified
+    test_match = re.search(r'\[TEST:\s*(.+?)\]', task, re.IGNORECASE)
+    if test_match:
+        test_command = test_match.group(1)
+        wants_test = True
+        task = re.sub(r'\[TEST:\s*.+?\]', '', task).strip()
+
+    sandbox = Sandbox(project_root)
+
+    try:
+        # ── Generate/load code maps ───────────────────────────────────
+        from tools.code_index import generate_maps, list_sections, list_purposes
+        maps = await generate_maps(project_root)
+        general_map = maps["general"]
+        detailed_map = maps["detailed"]
+        purpose_map = maps.get("purpose", "")
+
+        # Empty project: clear maps so AIs don't try to look up nothing
+        is_new_project = (not detailed_map or detailed_map == "(empty project)")
+        if is_new_project:
+            detailed_map = ""
+            general_map = ""
+            purpose_map = ""
+
+        files = []
+        if detailed_map:
+            sections = list_sections(detailed_map)
+            status(f"Code map: {len(sections)} sections indexed")
+
+        purposes = list_purposes(purpose_map) if purpose_map else []
+        if purposes:
+            status(f"Purpose map: {len(purposes)} categories indexed")
+
+        # Build context from maps
+        context_parts = []
+
+        if general_map:
+            context_parts.append(f"PROJECT OVERVIEW (general map):\n{general_map}")
+
+            # List available sections
+            if detailed_map and sections:
+                section_list = "\n".join(f"  - {s}" for s in sections)
+                context_parts.append(
+                    f"AVAILABLE CODE SECTIONS (use [DETAIL: name] to expand):\n"
+                    f"{section_list}"
+                )
+
+            # List available purpose categories
+            if purposes:
+                purpose_list = "\n".join(f"  - {p}" for p in purposes)
+                context_parts.append(
+                    f"AVAILABLE PURPOSE CATEGORIES (use [PURPOSE: name] to see all code for a purpose):\n"
+                    f"{purpose_list}\n"
+                    f"Each category returns ALL code snippets that serve that purpose,\n"
+                    f"with 10 lines of context. Assume nothing else in the project serves\n"
+                    f"that purpose beyond what's listed."
+                )
+
+            # Auto-inject relevant knowledge based on the task
+            from knowledge import get_auto_inject, list_knowledge
+            knowledge_text = get_auto_inject(task)
+            if knowledge_text:
+                context_parts.append(knowledge_text)
+
+            # List available knowledge topics
+            knowledge_topics = list_knowledge()
+            if knowledge_topics:
+                kl = ", ".join(knowledge_topics)
+                context_parts.append(
+                    f"AVAILABLE KNOWLEDGE (use [KNOWLEDGE: topic] to consult):\n"
+                    f"  {kl}"
+                )
+
+            context_parts.append(
+                "TOOLS — use in order, escalate only if you need more:\n"
+                "  1. [REFS: name]          — definitions, imports, usages (fast)\n"
+                "  2. [LSP: name]           — semantic deps, types (if REFS not enough)\n"
+                "  3. [DETAIL: section]     — organized code map for a feature\n"
+                "     [PURPOSE: category]   — all code for a purpose (e.g. 'UI colors')\n"
+                "  4. [CODE: path/to/file]  — read actual source code (last resort)\n"
+                "     [SEARCH: pattern]     — ripgrep search\n"
+                "     [WEBSEARCH: query]    — web search for API docs\n"
+                "  [KNOWLEDGE: topic]       — consult design/game/planning guidelines\n"
+                "Write tags, then STOP on its own line."
+            )
+        else:
+            context_parts.append(
+                f"PROJECT: {project_root}\n"
+                f"STATUS: New project — no existing code. Create all files from scratch.\n"
+                f"Do NOT use [DETAIL:] or [CODE:] tags — there is nothing to look up.\n"
+                f"Just write the complete implementation directly."
+            )
+
+        context = "\n\n".join(context_parts)
+
+        # Create sandbox
+        sandbox.setup()
+
+        # ── Phase 2: PLAN ────────────────────────────────────────────────
+        plan, research_cache = await phase_plan(
+            task, context, complexity, project_root, "", detailed_map,
+            purpose_map=purpose_map, is_new_project=is_new_project,
+        )
+
+        # Extract files to modify from plan
+        files_to_modify = _extract_files_from_plan(plan, files)
+        if not files_to_modify:
+            files_to_modify = []
+        status(f"Files to modify: {', '.join(files_to_modify) or '(new files)'}")
+        status(f"Sharing {len(research_cache)} cached lookups with coders + reviewers")
+
+        # ── Phase 3: IMPLEMENT (parallel coders, shared research) ────────
+        final_plan, sandbox = await phase_implement(
+            task, plan, context, sandbox, project_root, files_to_modify, detailed_map,
+            purpose_map=purpose_map, research_cache=research_cache,
+        )
+
+        # ── Phase 3.5: CODE REVIEW (GLM-5 checks code against plan) ─────
+        had_fixes, sandbox = await phase_review(
+            task, plan, sandbox, project_root, detailed_map, purpose_map, context,
+            research_cache=research_cache,
+        )
+
+        # ── Phase 4: TEST (optional) ─────────────────────────────────────
+        if wants_test and test_command:
+            test_result = await phase_test(test_command, project_root)
+            if not test_result["passed"]:
+                warn("Tests failed — including failure info in output")
+                context += f"\n\nTEST FAILURE:\n{test_result['output']}"
+
+        # ── Phase 5: DELIVER ─────────────────────────────────────────────
+        step("═══ Phase 5: DELIVER ═══")
+
+        diff = sandbox.get_all_diffs()
+        file_summary = sandbox.summary()
+
+        # Ask DeepSeek to summarize AND update maps in parallel
+        step("DeepSeek summarizing + updating maps...")
+
+        summary_task = _call(IMPLEMENT_MODEL, SUMMARY_PROMPT.format(
+            task=task,
+            files_changed=file_summary,
+            diff=diff[:15000],
+        ), max_tokens=2048, log_label="summarizing changes")
+
+        map_update_task = _call(IMPLEMENT_MODEL, MAP_UPDATE_PROMPT.format(
+            task=task,
+            files_changed=file_summary,
+            diff=diff[:15000],
+            general_map=general_map[:8000],
+            detailed_map=detailed_map[:30000],
+        ), log_label="updating code maps")
+
+        summary_result, map_result = await asyncio.gather(
+            summary_task, map_update_task
+        )
+
+        ai_summary = summary_result["answer"] if summary_result.get("answer") else file_summary
+
+        # Parse map edits from map_result and apply them
+        updated_general = general_map  # fallback: keep current
+        updated_detailed = detailed_map
+        if map_result.get("answer"):
+            raw = map_result["answer"]
+
+            # Split response into general edits section and detailed edits section
+            gen_match = re.search(
+                r'===\s*GENERAL\s*MAP\s*EDITS\s*===(.*?)(?====\s*DETAILED\s*MAP\s*EDITS\s*===|$)',
+                raw, re.DOTALL | re.IGNORECASE
+            )
+            det_match = re.search(
+                r'===\s*DETAILED\s*MAP\s*EDITS\s*===(.*)',
+                raw, re.DOTALL | re.IGNORECASE
+            )
+
+            if gen_match and "no changes" not in gen_match.group(1).lower()[:100]:
+                updated_general = _apply_map_edits(general_map, gen_match.group(1))
+            if det_match and "no changes" not in det_match.group(1).lower()[:100]:
+                updated_detailed = _apply_map_edits(detailed_map, det_match.group(1))
+
+        output = f"""## Changes Ready
+
+{ai_summary}
+
+Apply these changes to {project_root}? (y/n)"""
+
+        state["final_answer"] = output
+        state["pending_sandbox"] = sandbox
+        state["updated_maps"] = {
+            "general": updated_general,
+            "detailed": updated_detailed,
+        }
+        success("Coding agent complete — waiting for user approval")
+
+    except Exception as e:
+        error(f"Coding agent failed: {e}")
+        state["final_answer"] = f"Coding agent error: {e}\n\nPartial results may be in the sandbox."
+
+    finally:
+        # Don't cleanup sandbox — user might want to inspect
+        pass
+
+    return state
+
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _extract_files_from_plan(plan: str, known_files: list[str]) -> list[str]:
+    """Extract file paths from the plan text (files to MODIFY)."""
+    files = set()
+
+    for line in plan.split("\n"):
+        matches = re.findall(r'[\w./\-]+\.(?:py|js|ts|html|css|json|lean|c|cpp|h|rs|java|go|rb|toml|yaml|yml|md)', line)
+        files.update(matches)
+
+    for f in known_files:
+        if f in plan:
+            files.add(f)
+
+    return sorted(files)
+
+
+def _extract_new_files_from_plan(plan: str) -> list[str]:
+    """Extract files to CREATE from the plan (listed under FILES TO CREATE)."""
+    files = []
+    in_create_section = False
+
+    for line in plan.split("\n"):
+        line_stripped = line.strip()
+        if re.match(r'#+\s*FILES?\s*TO\s*CREATE', line_stripped, re.IGNORECASE):
+            in_create_section = True
+            continue
+        if in_create_section:
+            if line_stripped.startswith("##") or (not line_stripped and files):
+                break  # End of section
+            matches = re.findall(r'[\w./\-]+\.(?:py|js|ts|html|css|json|lean|c|cpp|h|rs|java|go|rb|toml|yaml|yml|md)', line_stripped)
+            files.extend(matches)
+
+    return files
+
+
+def _guess_filename(task: str, content: str) -> str:
+    """Guess a filename from task description and file content."""
+    task_lower = task.lower()
+    content_start = content[:200].lower()
+
+    # Detect from content
+    if "<!doctype html" in content_start or "<html" in content_start:
+        return "index.html"
+    if content_start.strip().startswith("<!doctype"):
+        return "index.html"
+    if "import react" in content_start or "from react" in content_start:
+        return "App.jsx"
+    if "package main" in content_start:
+        return "main.go"
+    if "fn main" in content_start:
+        return "main.rs"
+    if "public class" in content_start or "public static void main" in content_start:
+        return "Main.java"
+    if "#include" in content_start:
+        return "main.cpp" if "iostream" in content_start else "main.c"
+    if "theorem " in content_start or "import Mathlib" in content_start:
+        return "proof.lean"
+    if content_start.strip().startswith("{"):
+        return "data.json"
+
+    # Detect from task
+    if any(kw in task_lower for kw in ["html", "webpage", "website"]):
+        return "index.html"
+    if any(kw in task_lower for kw in [" css", "stylesheet"]):
+        return "style.css"
+    if any(kw in task_lower for kw in ["javascript", " js ", ".js"]):
+        return "script.js"
+    if any(kw in task_lower for kw in ["react", "component", "jsx"]):
+        return "App.jsx"
+    if any(kw in task_lower for kw in ["lean", "formal proof", "theorem prover"]):
+        return "proof.lean"
+    if any(kw in task_lower for kw in ["rust", "cargo"]):
+        return "main.rs"
+    if any(kw in task_lower for kw in ["web app", "web game", "for chrome", "browser game", "in browser"]):
+        return "index.html"
+
+    # Default to Python
+    return "main.py"

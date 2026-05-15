@@ -2804,6 +2804,7 @@ async def call_with_tools(
                     or _BARE_CONTINUE.search(_mask_bare)):
                 _suspected_bare_signal = True
 
+
         # ── Detect tool tags via the bulletproof TagDetector ──────────────
         # Single source of truth. TagDetector runs two independent extraction
         # passes (DOTALL regex + bracket-scan), classifies every match with

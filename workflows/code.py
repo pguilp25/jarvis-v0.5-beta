@@ -733,6 +733,56 @@ add it to the list with a one-sentence justification — but you may
 do this AT MOST ONCE per investigation.
 
 ══════════════════════════════════════════════════════════════════════
+DON'T DRAFT THE PLAN IN VISIBLE THINKING — write it INSIDE === PLAN ===
+══════════════════════════════════════════════════════════════════════
+
+Looking at a tool result and writing a one-or-two-line integration of
+it ("the [REFS:] result confirms only one caller — safe to rename")
+is GOOD — that's normal reasoning across rounds. Keep doing it.
+
+The failure mode this section addresses is different: the model writes
+the PLAN ITSELF in visible thinking (architecture decisions, data
+structures, draft steps, Q&A decision trees) BEFORE opening the
+`=== PLAN ===` block. Then when it finally opens the block, it just
+transcribes what it already wrote. Result: two copies of the plan,
+one in unrenderable thinking-prose, one in the artifact.
+
+Signatures of half-the-plan-in-thinking (avoid these):
+
+  ✗ "## Design Decisions" followed by Q1/Q2/Q3/Q4 questions, each
+     answered with an architecture mini-essay. If you're choosing
+     between approaches, do it in `[think]` with two short bullets
+     and pick one — don't write a six-question Q&A in your visible
+     response.
+
+  ✗ Long JSON / dict / data-structure proposals in your visible
+     output to "design the schema". The schema belongs in the plan
+     body (## SHARED INTERFACES). If you're sketching a schema in
+     visible prose first and then re-writing it in `=== PLAN ===`,
+     you've done it twice.
+
+  ✗ A `## Approach` or `## Architecture` section in visible output
+     that pseudo-enumerates the steps you're about to put in
+     `## IMPLEMENTATION STEPS`. The steps go in the plan; the
+     reasoning behind them goes in `[think]`, not next to them.
+
+  ✗ Restating the user's task verbatim before reasoning about it.
+     The task is in `[USER REQUEST]` above; quoting it back wastes
+     a paragraph.
+
+WHAT TO DO INSTEAD:
+  • Integrate tool results in 1-3 lines of `[think]` or plain prose
+    — name what changed (REINFORCE / REVISE / DEEPER) and move on.
+  • When you're ready to design the plan, OPEN `=== PLAN ===`
+    directly and write inside it. The plan IS your design document.
+  • If a real choice needs deliberation, do it in `[think]` with a
+    short side-by-side, pick one, move on. No question trees.
+
+Brief recap of prior-round findings is FINE when it's actually
+brief (a paragraph max) — the rule is "don't double-write the
+plan", not "don't think between rounds".
+
+══════════════════════════════════════════════════════════════════════
 REASONING — angles to consider, not a checklist to fill in
 ══════════════════════════════════════════════════════════════════════
 

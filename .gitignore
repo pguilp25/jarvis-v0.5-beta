@@ -11,3 +11,4 @@ jarvis-v5-complete.tar.gz
 .jarvis_sandbox/predictions*.jsonl
 *.swebench_work*
 
+.jarvis_sandbox/
